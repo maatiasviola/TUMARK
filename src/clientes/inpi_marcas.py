@@ -1,0 +1,59 @@
+import aiohttp
+import asyncio
+import requests # Necesario para el fallback sincrónico de vistas
+
+URL_GRILLA_MARCAS = "https://portaltramites.inpi.gob.ar/MarcasConsultas/GrillaMarcasAvanzada"
+URL_DETALLE_MARCA = "https://portaltramites.inpi.gob.ar/MarcasConsultas/Resultado"
+URL_DETALLE_VISTA = "https://portaltramites.inpi.gob.ar/MarcasConsultas/ObtenerVistaTexto"
+
+HEADERS = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+# --- MÉTODOS ASÍNCRONOS (Para velocidad masiva en Worker) ---
+
+async def obtener_lista_actas(session, payload):
+    """[ASYNC] Obtiene la lista de IDs de actas desde la grilla."""
+    try:
+        async with session.post(URL_GRILLA_MARCAS, headers=HEADERS, data=payload, timeout=30) as response:
+            if response.status == 200:
+                data = await response.json()
+                filas = data.get("rows", [])
+                return [f['Acta'] for f in filas if f.get('Acta')]
+            else:
+                print(f"⚠️ Grilla Status {response.status}")
+    except Exception as e:
+        print(f"❌ Error Async Grilla: {e}")
+    return []
+
+async def obtener_html_detalle(session, nro_acta, proxy=None):
+    """[ASYNC] Obtiene el HTML del detalle de una marca."""
+    payload = {"acta": nro_acta}
+    try:
+        async with session.post(
+            URL_DETALLE_MARCA, 
+            headers=HEADERS, 
+            data=payload, 
+            proxy=proxy, 
+            timeout=30
+        ) as response:
+            if response.status == 200:
+                return await response.text()
+    except Exception:
+        return None
+    return None
+
+# --- MÉTODOS SINCRÓNICOS (Para compatibilidad con servicio_tramite) ---
+
+def obtener_texto_vista(id_vista):
+    """
+    [SYNC] Obtiene el texto de una vista.
+    Se mantiene con 'requests' porque es llamado dentro de la lógica de negocio sincrónica.
+    """
+    try:
+        res = requests.get(URL_DETALLE_VISTA, headers=HEADERS, params={"Cod_VistaExp": id_vista}, timeout=10)
+        return res.text if res.status_code == 200 else ""
+    except Exception as e:
+        print(f"⚠️ Error obteniendo vista {id_vista}: {e}")
+        return ""
