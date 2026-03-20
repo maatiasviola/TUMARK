@@ -94,6 +94,7 @@ import aiohttp
 import boto3
 import random
 from src.servicios import servicio_tramite
+from src.db import transacciones
 from src.clientes import inpi_marcas
 from src.parsers import html_parser
 
@@ -158,7 +159,7 @@ async def worker_sqs():
 
             if lote_para_db:
                 # 4. GUARDADO MASIVO (Un solo viaje a la DB por las 10 actas)
-                exito_db = servicio_tramite.guardar_lote_tramites(lote_para_db)
+                exito_db = transacciones.guardar_lote_tramites(lote_para_db)
                 
                 if exito_db:
                     # 5. BORRADO MASIVO EN SQS (Para ahorrar costos de API calls)
