@@ -68,6 +68,7 @@ async def poblar_tabla_control_actas():
 
 import asyncio
 import os
+import time
 import sys
 import aiohttp
 import boto3
@@ -94,20 +95,39 @@ SQS_QUEUE_URL = settings.SQS_QUEUE_URL
 TAMANO_PAGINA = 1000
 
 def enviar_a_sqs_batch(lista_ids):
-    """Envía IDs a SQS en lotes de 10 (límite de AWS)"""
+    """Envía IDs a SQS en lotes de 10 y reintenta automáticamente los fallidos"""
     for i in range(0, len(lista_ids), 10):
         batch = lista_ids[i:i + 10]
-        entries = [
-            {'Id': str(idx), 'MessageBody': str(nro)} 
-            for idx, nro in enumerate(batch)
-        ]
-        sqs.send_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=entries)
+        
+        # Usamos el mismo nro de acta como 'Id' del mensaje para facilitar el seguimiento
+        entries = [{'Id': str(nro), 'MessageBody': str(nro)} for nro in batch]
+        
+        max_reintentos = 3
+        for intento in range(max_reintentos):
+            if not entries:
+                break  # Si la lista de entries está vacía, ya se enviaron todos
+                
+            response = sqs.send_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=entries)
+            
+            # AWS devuelve una lista 'Failed' si algún mensaje del lote no entró
+            fallidos = response.get('Failed', [])
+            
+            if not fallidos:
+                break  # Todo OK, salimos del bucle de reintentos
+                
+            print(f"   ⚠️ {len(fallidos)} mensajes fallaron en SQS. Reintentando (Intento {intento + 1})...")
+            
+            # Filtramos la lista original para quedarnos SOLO con los que fallaron
+            ids_fallidos = [f['Id'] for f in fallidos]
+            entries = [e for e in entries if e['Id'] in ids_fallidos]
+            
+            time.sleep(1) # Pequeña pausa de red antes de volver a intentar
 
 async def poblar_sqs_por_mes():
     print("🚀 INICIANDO SEMBRADO EN SQS")
     
-    fecha_inicio = datetime(2023, 10, 11) 
-    fecha_actual_tope = datetime(2023, 10, 20)
+    fecha_inicio = datetime(2023, 10, 1) 
+    fecha_actual_tope = datetime(2023, 10, 7)
     cursor_fecha = fecha_inicio
 
     async with aiohttp.ClientSession() as session:
