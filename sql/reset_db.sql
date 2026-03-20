@@ -104,7 +104,8 @@ CREATE TABLE actas (
     fecha_ingreso DATE,
     fecha_vencimiento DATE,
     nro_resolucion INT,
-    fecha_disposicion DATE
+    fecha_disposicion DATE,
+    es_clase_completa BOOLEAN
 );
 
 -- TABLA AGREGADA (Estaba en diagrama, faltaba en script)

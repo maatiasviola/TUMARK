@@ -107,7 +107,7 @@ async def poblar_sqs_por_mes():
     print("🚀 INICIANDO SEMBRADO EN SQS")
     
     fecha_inicio = datetime(2023, 10, 11) 
-    fecha_actual_tope = datetime(2023, 11, 20)
+    fecha_actual_tope = datetime(2023, 10, 20)
     cursor_fecha = fecha_inicio
 
     async with aiohttp.ClientSession() as session:

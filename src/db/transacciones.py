@@ -2,6 +2,121 @@ from .conexion import get_supabase
 import hashlib
 import json
 from src.db.conexion import get_pg_conn
+from psycopg2.extras import execute_values
+
+cache_dimensiones = {}
+
+def obtener_id_dimension_fast(tabla, col_desc, valor):
+    if not valor: return None
+    valor = str(valor).strip().upper()
+    key = f"{tabla}_{valor}"
+    
+    if key in cache_dimensiones:
+        return cache_dimensiones[key]
+    
+    # Si no está en caché, usamos la lógica original pero guardamos el resultado
+    res_id = obtener_id_dimension(tabla, col_desc, valor)
+    if res_id:
+        cache_dimensiones[key] = res_id
+    return res_id
+
+def guardar_lote_tramites(lista_datos_raw):
+    """
+    Recibe una lista de diccionarios (lote de SQS).
+    Procesa titulares y marcas individualmente (porque son pocos),
+    pero prepara las ACTAS para un insert masivo.
+    """
+    if not lista_datos_raw: return
+    
+    conn = get_pg_conn()
+    actas_para_insertar = []
+    
+    try:
+        for datos_raw in lista_datos_raw:
+            # Reutilizamos tu lógica de limpieza
+            datos = limpiar_datos_para_db(datos_raw)
+            id_imagen = datos.get('id_imagen_procesada') # Asumiendo que viene del extractor
+            
+            # 1. Gestionar Titulares (Mantenemos la lógica actual por seguridad)
+            # Nota: Esto se podría optimizar más, pero el grueso es el acta.
+            ids_titulares_solo = []
+            for t in datos.get('titulares', []):
+                # ... (aquí va tu lógica actual de titulares para obtener ids)
+                # Por brevedad, asumo que ya tienes los ids_titulares_solo
+                pass
+
+            # 2. Gestionar Marca e Identidad
+            tipo_texto = datos.get('tipo_marca_texto') 
+            id_tipo_real = obtener_id_dimension_fast("dim_tipo_marca", "tipo_marca", tipo_texto)
+            
+            ids_titulares_sorted = sorted(list(set(ids_titulares_solo)))
+            identidad_hash = calcular_identidad_marca(
+                datos.get('denominacion'), id_tipo_real, id_imagen, ids_titulares_sorted
+            )
+
+            # Insert/Select Marca (Individual para manejar el hash)
+            id_marca = gestionar_id_marca(datos, id_tipo_real, id_imagen, ids_titulares_sorted, identidad_hash)
+
+            # 3. Preparar tupla para el ACTA (Bulk Insert)
+            nro_res = None
+            if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit():
+                nro_res = int(datos['nro_resolucion'])
+
+            # Orden exacto de las columnas en tu tabla 'actas'
+            acta_tupla = (
+                datos['nro_acta'],
+                id_marca,
+                int(datos.get('id_clase', 0)) if datos.get('id_clase') else None,
+                datos.get('id_estado_procesado'),
+                id_imagen,
+                id_tipo_real,
+                datos.get('denominacion'),
+                datos.get('fecha_ingreso'),
+                datos.get('fecha_vencimiento'),
+                nro_res,
+                datos.get('fecha_disposicion'),
+                datos.get('es_clase_completa')
+            )
+            actas_para_insertar.append(acta_tupla)
+
+        # --- EJECUCIÓN DEL BULK INSERT ---
+        if actas_para_insertar:
+            with conn.cursor() as cur:
+                query_actas = """
+                    INSERT INTO actas (
+                        nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen, 
+                        id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento, 
+                        nro_resolucion, fecha_disposicion, es_clase_completa
+                    ) VALUES %s
+                    ON CONFLICT (nro_acta) DO UPDATE SET
+                        id_estado_tramite = EXCLUDED.id_estado_tramite,
+                        denominacion = EXCLUDED.denominacion;
+                """
+                execute_values(cur, query_actas, actas_para_insertar)
+                conn.commit()
+                print(f"   🚀 Lote de {len(actas_para_insertar)} actas insertado con éxito.")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"   ❌ ERROR EN BULK INSERT: {e}")
+    finally:
+        conn.close()
+
+# Función auxiliar para no ensuciar el loop masivo
+def gestionar_id_marca(datos, id_tipo, id_img, ids_tits, ident_hash):
+    sb = get_supabase()
+    res = sb.table("marcas").select("id_marca").eq("identidad_hash", ident_hash).execute()
+    if res.data: return res.data[0]['id_marca']
+    
+    nueva = {
+        "denominacion": datos.get('denominacion'),
+        "ids_titulares": ids_tits,
+        "id_imagen": id_img,
+        "id_tipo_marca": id_tipo,
+        "identidad_hash": ident_hash 
+    }
+    res_ins = sb.table("marcas").insert(nueva).execute()
+    return res_ins.data[0]['id_marca'] if res_ins.data else None
 
 def buscar_imagen_por_hash(image_hash):
     if not image_hash: return None

@@ -97,60 +97,81 @@ from src.servicios import servicio_tramite
 from src.clientes import inpi_marcas
 from src.parsers import html_parser
 
-# Configuración
+# --- CONFIGURACIÓN ---
 SQS_QUEUE_URL = "https://sqs.us-east-2.amazonaws.com/260307468224/inpi-ingesta-historica-queue"
-CONCURRENCIA_MAXIMA = 5
+CONCURRENCIA_MAXIMA = 15  # Aumentada: la EC2 puede manejar más pedidos de red en paralelo
 MAX_INTENTOS = 3
 sqs = boto3.client('sqs', region_name='us-east-2')
 
-async def procesar_acta_async(session, nro_acta, receipt_handle, sem):
+async def extraer_datos_acta_async(session, nro_acta, receipt_handle, sem):
+    """
+    Se encarga SOLO de la parte de red y parsing. 
+    Devuelve los datos listos para la DB o None si falló.
+    """
     async with sem:
         for intento in range(1, MAX_INTENTOS + 1):
             try:
                 html = await inpi_marcas.obtener_html_detalle(session, nro_acta)
                 if html:
-                    datos_tramite = html_parser.parsear_detalle_html(html, nro_acta)
-                    if datos_tramite:
-                        exito = servicio_tramite.procesar_e_insertar_acta_desde_datos(datos_tramite)
-                        if exito:
-                            # BORRAR MENSAJE DE SQS SI TODO SALIÓ BIEN
-                            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
-                            return nro_acta, "OK"
+                    datos = html_parser.parsear_detalle_html(html, nro_acta)
+                    if datos:
+                        # Devolvemos los datos y el handle para borrarlo después
+                        return {"datos": datos, "handle": receipt_handle, "nro": nro_acta}
                 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ Error red acta {nro_acta} (intento {intento}): {e}")
             
             if intento < MAX_INTENTOS:
                 await asyncio.sleep((2 ** intento) + random.uniform(0, 1))
         
-        return nro_acta, "FAIL"
+        return None
 
 async def worker_sqs():
     sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
-    print(f"🚀 Worker EC2 escuchando SQS... (Concurrencia: {CONCURRENCIA_MAXIMA})")
+    print(f"🚀 Worker EC2 en modo BATCH iniciado...")
 
     async with aiohttp.ClientSession() as session:
         while True:
-            # Pedir mensajes a SQS (Long Polling)
+            # 1. Pedir lote de 10 mensajes (Max permitido por SQS)
             response = sqs.receive_message(
                 QueueUrl=SQS_QUEUE_URL,
                 MaxNumberOfMessages=10,
-                WaitTimeSeconds=20  # Reduce costos y latencia
+                WaitTimeSeconds=20
             )
 
             mensajes = response.get('Messages', [])
             if not mensajes:
-                print("💤 No hay mensajes. Esperando...")
+                print("💤 Cola vacía. Esperando...")
                 continue
 
+            # 2. LANZAR EXTRACCIONES EN PARALELO
             tasks = []
             for msg in mensajes:
-                nro_acta = msg['Body']
-                receipt_handle = msg['ReceiptHandle']
-                tasks.append(procesar_acta_async(session, nro_acta, receipt_handle, sem))
+                tasks.append(extraer_datos_acta_async(session, msg['Body'], msg['ReceiptHandle'], sem))
 
-            await asyncio.gather(*tasks)
-            print(f"✅ Procesado lote de {len(mensajes)} mensajes.")
+            # Esperamos a que terminen las 10 extracciones de red
+            resultados = await asyncio.gather(*tasks)
+
+            # 3. FILTRAR RESULTADOS EXITOSOS
+            lote_para_db = [r['datos'] for r in resultados if r is not None]
+            handles_exitosos = [r['handle'] for r in resultados if r is not None]
+
+            if lote_para_db:
+                # 4. GUARDADO MASIVO (Un solo viaje a la DB por las 10 actas)
+                exito_db = servicio_tramite.guardar_lote_tramites(lote_para_db)
+                
+                if exito_db:
+                    # 5. BORRADO MASIVO EN SQS (Para ahorrar costos de API calls)
+                    entries = [
+                        {'Id': str(i), 'ReceiptHandle': h} 
+                        for i, h in enumerate(handles_exitosos)
+                    ]
+                    sqs.delete_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=entries)
+                    print(f"✅ Lote de {len(lote_para_db)} procesado y borrado de SQS.")
+                else:
+                    print("❌ Falló el guardado en DB, los mensajes volverán a la cola.")
+            else:
+                print("⚠️ Ninguna acta del lote pudo ser extraída.")
 
 if __name__ == "__main__":
     asyncio.run(worker_sqs())
