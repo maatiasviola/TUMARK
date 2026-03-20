@@ -1,3 +1,4 @@
+"""
 import asyncio
 import aiohttp
 import random
@@ -86,3 +87,70 @@ async def worker_principal():
 
 if __name__ == "__main__":
     asyncio.run(worker_principal())
+"""
+
+import asyncio
+import aiohttp
+import boto3
+import random
+from src.servicios import servicio_tramite
+from src.clientes import inpi_marcas
+from src.parsers import html_parser
+
+# Configuración
+SQS_QUEUE_URL = "https://sqs.us-east-2.amazonaws.com/260307468224/inpi-ingesta-historica-queue"
+CONCURRENCIA_MAXIMA = 5
+MAX_INTENTOS = 3
+sqs = boto3.client('sqs', region_name='us-east-2')
+
+async def procesar_acta_async(session, nro_acta, receipt_handle, sem):
+    async with sem:
+        for intento in range(1, MAX_INTENTOS + 1):
+            try:
+                html = await inpi_marcas.obtener_html_detalle(session, nro_acta)
+                if html:
+                    datos_tramite = html_parser.parsear_detalle_html(html, nro_acta)
+                    if datos_tramite:
+                        exito = servicio_tramite.procesar_e_insertar_acta_desde_datos(datos_tramite)
+                        if exito:
+                            # BORRAR MENSAJE DE SQS SI TODO SALIÓ BIEN
+                            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
+                            return nro_acta, "OK"
+                
+            except Exception:
+                pass
+            
+            if intento < MAX_INTENTOS:
+                await asyncio.sleep((2 ** intento) + random.uniform(0, 1))
+        
+        return nro_acta, "FAIL"
+
+async def worker_sqs():
+    sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
+    print(f"🚀 Worker EC2 escuchando SQS... (Concurrencia: {CONCURRENCIA_MAXIMA})")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            # Pedir mensajes a SQS (Long Polling)
+            response = sqs.receive_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MaxNumberOfMessages=10,
+                WaitTimeSeconds=20  # Reduce costos y latencia
+            )
+
+            mensajes = response.get('Messages', [])
+            if not mensajes:
+                print("💤 No hay mensajes. Esperando...")
+                continue
+
+            tasks = []
+            for msg in mensajes:
+                nro_acta = msg['Body']
+                receipt_handle = msg['ReceiptHandle']
+                tasks.append(procesar_acta_async(session, nro_acta, receipt_handle, sem))
+
+            await asyncio.gather(*tasks)
+            print(f"✅ Procesado lote de {len(mensajes)} mensajes.")
+
+if __name__ == "__main__":
+    asyncio.run(worker_sqs())

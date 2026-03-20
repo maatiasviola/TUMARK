@@ -1,3 +1,4 @@
+"""
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
@@ -63,3 +64,82 @@ async def poblar_tabla_control_actas():
             cursor_fecha = fecha_hasta_lote + timedelta(days=1)
 
     print("\n🏁 Sembrado Finalizado.")
+"""
+
+import asyncio
+import os
+import sys
+import aiohttp
+import boto3
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+
+from src.clientes import inpi_marcas
+
+from src.config import settings  # Importás tu archivo de configuración
+
+# Crear el cliente usando las variables del .env
+sqs = boto3.client(
+    'sqs',
+    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    region_name=settings.AWS_REGION
+)
+
+SQS_QUEUE_URL = settings.SQS_QUEUE_URL
+
+
+TAMANO_PAGINA = 1000
+
+def enviar_a_sqs_batch(lista_ids):
+    """Envía IDs a SQS en lotes de 10 (límite de AWS)"""
+    for i in range(0, len(lista_ids), 10):
+        batch = lista_ids[i:i + 10]
+        entries = [
+            {'Id': str(idx), 'MessageBody': str(nro)} 
+            for idx, nro in enumerate(batch)
+        ]
+        sqs.send_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=entries)
+
+async def poblar_sqs_por_mes():
+    print("🚀 INICIANDO SEMBRADO EN SQS")
+    
+    fecha_inicio = datetime(2023, 10, 11) 
+    fecha_actual_tope = datetime(2023, 11, 20)
+    cursor_fecha = fecha_inicio
+
+    async with aiohttp.ClientSession() as session:
+        while cursor_fecha < fecha_actual_tope:
+            proximo_mes = cursor_fecha + relativedelta(months=1)
+            fecha_hasta_lote = min(proximo_mes, fecha_actual_tope)
+            
+            s_desde = cursor_fecha.strftime("%d/%m/%Y")
+            s_hasta = (fecha_hasta_lote + timedelta(days=1)).strftime("%d/%m/%Y")
+            
+            print(f"📅 Consultando: {s_desde} al {s_hasta}")
+            
+            offset = 0
+            while True:
+                payload = {
+                    "Denominacion": "", "Titular": "", "Clase": "-1", "vigentes": "false",
+                    "Fecha_IngresoDesde": s_desde, "Fecha_IngresoHasta": s_hasta,
+                    "limit": TAMANO_PAGINA, "offset": offset
+                }
+
+                lista_ids = await inpi_marcas.obtener_lista_actas(session, payload)
+                if not lista_ids: break
+
+                # Enviar a SQS
+                enviar_a_sqs_batch(lista_ids)
+                print(f"   ↳ Lote de {len(lista_ids)} IDs enviado a SQS.")
+
+                if len(lista_ids) < TAMANO_PAGINA: break
+                offset += TAMANO_PAGINA
+                await asyncio.sleep(0.2)
+
+            cursor_fecha = fecha_hasta_lote + timedelta(days=1)
+
+if __name__ == "__main__":
+    asyncio.run(poblar_sqs_por_mes())
