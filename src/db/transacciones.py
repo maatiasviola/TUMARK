@@ -82,15 +82,27 @@ def guardar_lote_tramites(lista_datos_raw):
         # --- EJECUCIÓN DEL BULK INSERT ---
         if actas_para_insertar:
             with conn.cursor() as cur:
+                # 🛑 NOTA: Quitamos los paréntesis de VALUES (%) y dejamos solo %s
                 query_actas = """
-                    INSERT INTO actas ( ... ) ...
+                    INSERT INTO actas (
+                        nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen, 
+                        id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento, 
+                        nro_resolucion, fecha_disposicion, es_clase_completa
+                    ) VALUES %s
+                    ON CONFLICT (nro_acta) DO UPDATE SET
+                        id_estado_tramite = EXCLUDED.id_estado_tramite,
+                        id_marca = EXCLUDED.id_marca,
+                        denominacion = EXCLUDED.denominacion,
+                        fecha_vencimiento = EXCLUDED.fecha_vencimiento,
+                        nro_resolucion = EXCLUDED.nro_resolucion,
+                        fecha_disposicion = EXCLUDED.fecha_disposicion;
                 """
+                # execute_values se encarga de expandir el %s en (val1, val2), (val3, val4)...
                 execute_values(cur, query_actas, actas_para_insertar)
                 conn.commit()
                 print(f"   🚀 Lote de {len(actas_para_insertar)} actas insertado con éxito.")
                 
-        # ¡FALTABA ESTO! Todo salió bien, devolvemos True
-        return True
+            return True
 
     except Exception as e:
         conn.rollback()
