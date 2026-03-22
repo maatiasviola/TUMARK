@@ -274,6 +274,7 @@ def guardar_lote_tramites_completo(lista_datos_raw):
             id_a_interno = map_nroacta_idacta.get(datos['nro_acta'])
             if id_a_interno and datos.get('id_clase'):
                 procesar_productos(
+                    cur,
                     id_a_interno,
                     int(datos['id_clase']),
                     datos.get('proteccion', ''),
