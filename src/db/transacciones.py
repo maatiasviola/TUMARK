@@ -94,12 +94,15 @@ def guardar_lote_tramites_completo(lista_datos_raw):
                 id_tipo   = obtener_id_dimension("dim_tipo_marca", "tipo_marca", datos.get('tipo_marca_texto'))
                 id_estado = obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos.get('estado_tramite'))
                 id_img    = datos.get('id_imagen')
+                hash_img  = datos.get('hash_imagen') # <-- Leemos el hash que mandó el worker
 
+                # Calculamos usando el HASH, no el ID
                 identidad_hash = calcular_identidad_marca(
-                    datos.get('denominacion'), id_tipo, id_img, ids_titulares_sorted
+                    datos.get('denominacion'), id_tipo, hash_img, ids_titulares_sorted
                 )
 
                 if identidad_hash not in marcas_para_insertar:
+                    # En la tupla para la BD sí guardamos el id_img
                     marcas_para_insertar[identidad_hash] = (
                         datos.get('denominacion'), ids_titulares_sorted, id_img, id_tipo, identidad_hash
                     )
@@ -435,15 +438,17 @@ def procesar_productos(id_acta_interno, id_clase, proteccion_raw, limitacion_raw
 
 # --- 2. FUNCIÓN PRINCIPAL ---
 
-def calcular_identidad_marca(denominacion, id_tipo_marca, id_imagen, ids_titulares):
+def calcular_identidad_marca(denominacion, id_tipo_marca, hash_imagen, ids_titulares):
+    # Ya no recibimos el id_imagen, recibimos la firma SHA-256 (hash_imagen)
     denominacion_norm = denominacion.strip().upper() if denominacion else ""
     id_tipo = str(id_tipo_marca) if id_tipo_marca else "0"
-    id_img = str(id_imagen) if id_imagen else "0"
+    hash_img_str = str(hash_imagen) if hash_imagen else "0"
     
     tits_sorted = sorted([int(x) for x in ids_titulares]) if ids_titulares else []
     tits_str = json.dumps(tits_sorted, separators=(',', ':'))
     
-    semilla = f"{denominacion_norm}|{id_tipo}|{id_img}|{tits_str}"
+    # La semilla ahora es a prueba de migraciones de base de datos
+    semilla = f"{denominacion_norm}|{id_tipo}|{hash_img_str}|{tits_str}"
     
     hasher = hashlib.sha256(semilla.encode('utf-8'))
     hash_hex = hasher.hexdigest()

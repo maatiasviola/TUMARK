@@ -14,6 +14,7 @@ from src.clientes import inpi_marcas
 from src.parsers import html_parser
 from src.config import settings
 from src.db.metricas_ingesta import metricas
+from src.servicios.servicio_imagen import procesar_imagen
 import time
 
 SQS_QUEUE_URL       = settings.SQS_QUEUE_URL
@@ -49,6 +50,15 @@ async def extraer_datos_acta_async(session, nro_acta, receipt_handle, sem):
                 if html:
                     datos = html_parser.parsear_detalle_html(html, nro_acta)
                     if datos:
+                        if datos.get("url_imagen"):
+                            # to_thread evita que el procesamiento de la imagen congele las otras actas
+                            id_img, hash_img = await asyncio.to_thread(servicio_imagen.procesar_imagen, datos["url_imagen"])
+                            datos["id_imagen"] = id_img
+                            datos["hash_imagen"] = hash_img
+                        else:
+                            datos["id_imagen"] = None
+                            datos["hash_imagen"] = None
+                        
                         return {"datos": datos, "handle": receipt_handle, "nro": nro_acta}
             except Exception as e:
                 print(f"⚠️ Error red acta {nro_acta} (intento {intento}): {e}")

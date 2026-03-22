@@ -45,15 +45,12 @@ def _descargar_a_temp(url_origen, tmp_path):
 
 def procesar_imagen(url_origen):
     """
-    Orquestador de imágenes:
-    1. Descarga/Decodifica a temp.
-    2. Hashea.
-    3. Busca duplicado en DB (retorna ID si existe).
-    4. Si es nueva: Sube a Storage -> Inserta DB -> Retorna nuevo ID.
+    Retorna una tupla: (id_imagen, hash_imagen)
     """
-    if not url_origen: return None
+    if not url_origen: return None, None
 
     id_final = None
+    img_hash = None
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp_path = tmp.name
     
@@ -61,7 +58,7 @@ def procesar_imagen(url_origen):
         # 1. Obtener Archivo Físico
         if _descargar_a_temp(url_origen, tmp_path):
             
-            # 2. Hashing
+            # 2. Hashing (Firma Visual)
             img_hash = calcular_hash_imagen(tmp_path)
             
             if img_hash:
@@ -69,15 +66,13 @@ def procesar_imagen(url_origen):
                 duplicado = transacciones.buscar_imagen_por_hash(img_hash)
                 
                 if duplicado:
-                    id_final = duplicado[0] # (id, url)
-                    #print(f"   ♻️ Imagen UNIFICADA (ID: {id_final})")
+                    id_final = duplicado[0] 
                 else:
-                    # 4. Nueva Imagen
+                    # 4. Nueva Imagen (Sube a Storage instantáneamente)
                     url_pub = storage.subir_archivo_storage(tmp_path)
                     id_final = transacciones.insertar_imagen_hash(url_pub, img_hash)
-                    #print(f"   📸 Imagen Creada (ID: {id_final})")
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
             
-    return id_final
+    return id_final, img_hash
