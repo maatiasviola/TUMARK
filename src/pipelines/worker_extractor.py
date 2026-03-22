@@ -14,7 +14,7 @@ from src.clientes import inpi_marcas
 from src.parsers import html_parser
 from src.config import settings
 from src.db.metricas_ingesta import metricas
-from src.servicios.servicio_imagen import procesar_imagen
+from src.servicios import servicio_imagen
 import time
 
 SQS_QUEUE_URL       = settings.SQS_QUEUE_URL

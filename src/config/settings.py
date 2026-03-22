@@ -7,7 +7,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 DB_URI = os.getenv("DATABASE_URL")  # La de postgresql:// para vectores
-BUCKET_LOGOS = "newTM_prueba"       # El nombre de tu bucket en Supabase
+BUCKET_LOGOS = "TUMARK"       # El nombre de tu bucket en Supabase
 
 # RUTAS
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
