@@ -65,7 +65,7 @@ def lanzar_fase(nombre_fase):
         chunk_env["DATE_FROM"] = desde
         chunk_env["DATE_TO"]   = hasta
         p = subprocess.Popen(
-            [sys.executable, "poblar_actas.py"],
+            [sys.executable, "src/pipelines/poblar_actas.py"],
             env=chunk_env
         )
         procesos.append(("poblar", p))
@@ -78,7 +78,7 @@ def lanzar_fase(nombre_fase):
     # 3. Arrancar los workers
     for i in range(1, cfg["n_workers"] + 1):
         p = subprocess.Popen(
-            [sys.executable, "worker_extractor.py"],
+            [sys.executable, "src/pipelines/worker_extractor.py"],
             env=env
         )
         procesos.append(("worker", p))
