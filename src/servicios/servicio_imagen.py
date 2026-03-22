@@ -7,72 +7,61 @@ import io
 from PIL import Image
 from src.db import transacciones, storage
 
-def calcular_hash_imagen(ruta_imagen):
-    """
-    Calcula el hash SHA-256 de una imagen para identificación única.
-    """
-    try:
-        with Image.open(ruta_imagen) as img:
-            # Convertir a bytes manteniendo formato original si es posible
-            img_byte_arr = io.BytesIO()
-            fmt = img.format or 'PNG' 
-            img.save(img_byte_arr, format=fmt)
-            img_bytes = img_byte_arr.getvalue()
-            
-            # Calcular hash SHA-256
-            sha256_hash = hashlib.sha256(img_bytes).hexdigest()
-            return sha256_hash
-    except Exception as e:
-        print(f"   ⚠️ Error calculando Hash imagen: {e}")
-        return None
-
-def _descargar_a_temp(url_origen, tmp_path):
-    """Maneja http y base64."""
+def obtener_hash_y_bytes(url_origen):
+    """Procesa el Base64 o HTTP enteramente en memoria RAM."""
+    img_bytes = None
     try:
         if url_origen.startswith("data:image"):
             header, encoded = url_origen.split(",", 1)
-            data = base64.b64decode(encoded)
-            with open(tmp_path, 'wb') as f: f.write(data)
-            return True
+            img_bytes = base64.b64decode(encoded)
         elif url_origen.startswith("http"):
-            r = requests.get(url_origen, timeout=15)
+            r = requests.get(url_origen, timeout=10)
             if r.status_code == 200:
-                with open(tmp_path, 'wb') as f: f.write(r.content)
-                return True
+                img_bytes = r.content
+
+        if not img_bytes:
+            return None, None
+
+        # Normalizamos la imagen con PIL en memoria y calculamos Hash
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            buf = io.BytesIO()
+            fmt = img.format or 'PNG'
+            img.save(buf, format=fmt)
+            bytes_normalizados = buf.getvalue()
+            img_hash = hashlib.sha256(bytes_normalizados).hexdigest()
+            return img_hash, bytes_normalizados
+
     except Exception as e:
-        print(f"⚠️ Error descarga: {e}")
-    return False
+        print(f"   ⚠️ Error procesando imagen en RAM: {e}")
+        return None, None
 
 def procesar_imagen(url_origen):
     """
-    Retorna una tupla: (id_imagen, hash_imagen)
+    Retorna (id_imagen, hash_imagen). Operación optimizada para concurrencia masiva.
     """
     if not url_origen: return None, None
 
+    # 1. Hashing en RAM (Cero disco)
+    img_hash, img_bytes = obtener_hash_y_bytes(url_origen)
+    if not img_hash:
+        return None, None
+
+    # 2. Check Duplicado en BD
+    duplicado = transacciones.buscar_imagen_por_hash(img_hash)
+    if duplicado:
+        return duplicado[0], img_hash  # (id_imagen, hash_imagen)
+
+    # 3. Solo si es NUEVA, usamos tempfile para subir a Storage
     id_final = None
-    img_hash = None
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(img_bytes)
         tmp_path = tmp.name
-    
+
     try:
-        # 1. Obtener Archivo Físico
-        if _descargar_a_temp(url_origen, tmp_path):
-            
-            # 2. Hashing (Firma Visual)
-            img_hash = calcular_hash_imagen(tmp_path)
-            
-            if img_hash:
-                # 3. Check Duplicado
-                duplicado = transacciones.buscar_imagen_por_hash(img_hash)
-                
-                if duplicado:
-                    id_final = duplicado[0] 
-                else:
-                    # 4. Nueva Imagen (Sube a Storage instantáneamente)
-                    url_pub = storage.subir_archivo_storage(tmp_path)
-                    id_final = transacciones.insertar_imagen_hash(url_pub, img_hash)
+        url_pub = storage.subir_archivo_storage(tmp_path)
+        id_final = transacciones.insertar_imagen_hash(url_pub, img_hash)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-            
+
     return id_final, img_hash

@@ -315,9 +315,12 @@ def insertar_imagen_hash(url, image_hash):
     conn = get_pg_conn()
     try:
         with conn.cursor() as cur:
+            # El DO UPDATE obliga a Postgres a devolver el ID incluso si hubo conflicto
             query = """
                 INSERT INTO marcas_imagenes (url_imagen, hash_imagen)
-                VALUES (%s, %s) RETURNING id_imagen;
+                VALUES (%s, %s)
+                ON CONFLICT (hash_imagen) DO UPDATE SET hash_imagen = EXCLUDED.hash_imagen
+                RETURNING id_imagen;
             """
             cur.execute(query, (url, image_hash))
             id_gen = cur.fetchone()[0]
