@@ -266,20 +266,20 @@ def guardar_lote_tramites_completo(lista_datos_raw):
                     ) VALUES %s;
                 """, vistas_para_insertar)
 
-        # ─────────────────────────────────────────────────────────────────
-        # FASE 7 — Productos (fuera de la transacción, usa Supabase HTTP)
-        # FIX: itera lista_datos_procesados
-        # ─────────────────────────────────────────────────────────────────
-        for datos in lista_datos_procesados:
-            id_a_interno = map_nroacta_idacta.get(datos['nro_acta'])
-            if id_a_interno and datos.get('id_clase'):
-                procesar_productos(
-                    cur,
-                    id_a_interno,
-                    int(datos['id_clase']),
-                    datos.get('proteccion', ''),
-                    datos.get('limitacion', '')
-                )
+            # ─────────────────────────────────────────────────────────────────
+            # FASE 7 — Productos (fuera de la transacción, usa Supabase HTTP)
+            # FIX: itera lista_datos_procesados
+            # ─────────────────────────────────────────────────────────────────
+            for datos in lista_datos_procesados:
+                id_a_interno = map_nroacta_idacta.get(datos['nro_acta'])
+                if id_a_interno and datos.get('id_clase'):
+                    procesar_productos(
+                        cur,
+                        id_a_interno,
+                        int(datos['id_clase']),
+                        datos.get('proteccion', ''),
+                        datos.get('limitacion', '')
+                    )
 
             conn.commit()
             print(
@@ -493,119 +493,4 @@ def limpiar_datos_para_db(datos):
             elif k in campos_fecha and v.strip() == "00/00/0000": copia[k] = None
     
     return copia
-
-def guardar_tramite_completo(datos_raw, id_imagen=None):
-    """
-    Versión ÓPTIMA para procesar un solo acta (Simulaciones y Workers pequeños).
-    Guarda Titulares, Marcas, Actas, Oposiciones y Vistas en 1 sola transacción de base de datos.
-    """
-    datos = limpiar_datos_para_db(datos_raw)
-    conn = get_pg_conn()
-    
-    try:
-        with conn.cursor() as cur:
-            # 1. Dimensiones ultrarrápidas desde caché
-            id_tipo = obtener_id_dimension("dim_tipo_marca", "tipo_marca", datos.get('tipo_marca_texto'))
-            id_estado = obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos.get('estado_tramite'))
-            
-            # 2. Titulares
-            ids_titulares_solo = []
-            datos_vinculacion = []
-            for t in datos.get('titulares', []):
-                id_titular = _obtener_o_crear_titular_sql(cur, t)
-                if id_titular:
-                    ids_titulares_solo.append(id_titular)
-                    datos_vinculacion.append((datos['nro_acta'], id_titular, t.get('porcentaje', 100.0)))
-                    
-            ids_titulares_sorted = sorted(list(set(ids_titulares_solo)))
-            
-            # 3. Marca (Inserción/Actualización y obtención de ID al vuelo)
-            identidad_hash = calcular_identidad_marca(datos.get('denominacion'), id_tipo, id_imagen, ids_titulares_sorted)
-            cur.execute("""
-                INSERT INTO marcas (denominacion, ids_titulares, id_imagen, id_tipo_marca, identidad_hash)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (identidad_hash) DO UPDATE SET denominacion = EXCLUDED.denominacion
-                RETURNING id_marca;
-            """, (datos.get('denominacion'), ids_titulares_sorted, id_imagen, id_tipo, identidad_hash))
-            id_marca = cur.fetchone()[0]
-
-            # 4. Acta
-            nro_res = int(datos['nro_resolucion']) if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit() else None
-            cur.execute("""
-                INSERT INTO actas (
-                    nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen, 
-                    id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento, 
-                    nro_resolucion, fecha_disposicion, es_clase_completa
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (nro_acta) DO UPDATE SET
-                    id_estado_tramite = EXCLUDED.id_estado_tramite,
-                    id_marca = EXCLUDED.id_marca,
-                    denominacion = EXCLUDED.denominacion,
-                    fecha_vencimiento = EXCLUDED.fecha_vencimiento,
-                    nro_resolucion = EXCLUDED.nro_resolucion,
-                    fecha_disposicion = EXCLUDED.fecha_disposicion
-                RETURNING id_acta;
-            """, (
-                datos['nro_acta'], id_marca, datos.get('id_clase'), id_estado, id_imagen,
-                id_tipo, datos.get('denominacion'), datos.get('fecha_ingreso'), 
-                datos.get('fecha_vencimiento'), nro_res, datos.get('fecha_disposicion'), datos.get('es_clase_completa')
-            ))
-            id_acta_interno = cur.fetchone()[0]
-
-            # 5. Vinculación Actas-Titulares
-            if datos_vinculacion:
-                execute_values(cur, """
-                    INSERT INTO actas_titulares (nro_acta, id_titular, porcentaje)
-                    VALUES %s ON CONFLICT (nro_acta, id_titular) DO UPDATE SET porcentaje = EXCLUDED.porcentaje;
-                """, datos_vinculacion)
-
-            # 6. Oposiciones
-            map_nro_opo_idopo = {}
-            if datos.get('oposiciones'):
-                opos_data = [(id_acta_interno, o.get('Numero'), o.get('Oponente'), o.get('Fecha_Presentacion'), o.get('Fundamento'), o.get('Fecha_Levantamiento')) for o in datos['oposiciones']]
-                
-                # Fetch=True permite recuperar los IDs generados de las oposiciones
-                res_opos = execute_values(cur, """
-                    INSERT INTO oposiciones (id_acta, nro_oposicion, nombre_oponente, fecha_presentacion, fundamento, fecha_levantamiento)
-                    VALUES %s ON CONFLICT (id_acta, nro_oposicion) DO UPDATE SET
-                        nombre_oponente = EXCLUDED.nombre_oponente,
-                        fecha_levantamiento = EXCLUDED.fecha_levantamiento
-                    RETURNING nro_oposicion, id_oposicion;
-                """, opos_data, fetch=True)
-                
-                if res_opos:
-                    for row in res_opos:
-                        map_nro_opo_idopo[row[0]] = row[1]
-
-            # 7. Vistas
-            if datos.get('vistas'):
-                vistas_data = []
-                for v in datos['vistas']:
-                    id_tv = obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'))
-                    # Buscamos si esta vista tiene una oposición vinculada de las que acabamos de insertar
-                    id_opo_vinc = map_nro_opo_idopo.get(int(v.get('nro_oposicion_vinculada'))) if v.get('nro_oposicion_vinculada') else None
-                    
-                    vistas_data.append((id_acta_interno, id_opo_vinc, id_tv, v.get('Fecha_Vista'), v.get('Fecha_Vencimiento'), v.get('Fecha_Contestacion')))
-                
-                execute_values(cur, """
-                    INSERT INTO vistas (id_acta, id_oposicion, id_tipo_vista, fecha, fecha_vencimiento, fecha_contestacion)
-                    VALUES %s;
-                """, vistas_data)
-
-            # ¡Confirmamos toda la transacción!
-            conn.commit()
-            
-        # 8. Subitems (Fuera de la transacción estricta porque Supabase demora más)
-        if datos.get('id_clase'):
-            procesar_productos(id_acta_interno, int(datos['id_clase']), datos.get('proteccion', ''), datos.get('limitacion', ''))
-            
-        print(f" ✅ [Acta: {datos['nro_acta']}] Guardado ÓPTIMO completado exitosamente.")
-        return True
-
-    except Exception as e:
-        conn.rollback()
-        print(f" ❌ CRASH EN TRAMITE COMPLETO: {e}")
-        return False
-    finally:
-        conn.close()
     
