@@ -5,6 +5,7 @@ import random
 import ssl
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -45,14 +46,21 @@ async def extraer_datos_acta_async(session, nro_acta, receipt_handle, sem):
 
         for intento in range(1, MAX_INTENTOS + 1):
             try:
-                # ← CAMBIO 2: se agrega proxy=PROXY_URL (None = sin proxy, aiohttp lo ignora)
-                html = await inpi_marcas.obtener_html_detalle(session, nro_acta, proxy=PROXY_URL)
+                # 1. Guillotina para descargar el HTML (Máx 25 seg)
+                html = await asyncio.wait_for(
+                    inpi_marcas.obtener_html_detalle(session, nro_acta, proxy=PROXY_URL),
+                    timeout=25.0
+                )
+                
                 if html:
                     datos = html_parser.parsear_detalle_html(html, nro_acta)
                     if datos:
                         if datos.get("url_imagen"):
-                            # to_thread evita que el procesamiento de la imagen congele las otras actas
-                            id_img, hash_img = await asyncio.to_thread(servicio_imagen.procesar_imagen, datos["url_imagen"])
+                            # 2. Guillotina para procesar la imagen e IA/Storage (Máx 20 seg)
+                            id_img, hash_img = await asyncio.wait_for(
+                                asyncio.to_thread(servicio_imagen.procesar_imagen, datos["url_imagen"]),
+                                timeout=20.0
+                            )
                             datos["id_imagen"] = id_img
                             datos["hash_imagen"] = hash_img
                         else:
@@ -60,18 +68,25 @@ async def extraer_datos_acta_async(session, nro_acta, receipt_handle, sem):
                             datos["hash_imagen"] = None
                         
                         return {"datos": datos, "handle": receipt_handle, "nro": nro_acta}
-            except Exception as e:
-                print(f"⚠️ Error red acta {nro_acta} (intento {intento}): {e}")
+                        
+            # Capturamos los timeouts de las guillotinas para no frenar el programa
+            except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as e:
+                print(f" ⌛ Timeout o caída de red en acta {nro_acta} (intento {intento})")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
-
-
+                
+            except Exception as e:
+                print(f" ⚠️ Error red acta {nro_acta} (intento {intento}): {e}")
+                metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
 
             if intento < MAX_INTENTOS:
                 await asyncio.sleep(random.uniform(0.1, 0.5))
 
-        return None  # SQS reintentará; tras 3 recibos va a la DLQ automáticamente
-
+        return None
+    
 async def worker_sqs():
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=50))
+
     sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
     print(f"🚀 Worker iniciado | Concurrencia: {CONCURRENCIA_MAXIMA} | Delay: {DELAY_MIN}–{DELAY_MAX}s | Proxy: {'sí' if PROXY_URL else 'no'}")
 
@@ -80,9 +95,10 @@ async def worker_sqs():
     ssl_ctx = crear_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=CONCURRENCIA_MAXIMA)
 
-    #async with aiohttp.ClientSession(connector=connector) as session:
+    timeout_global = aiohttp.ClientTimeout(total=30.0)
     headers = {"Accept-Encoding": "gzip, deflate"}
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+    
+    async with aiohttp.ClientSession(connector=connector, headers=headers,timeout=timeout_global) as session:
         while True:
             response = await asyncio.to_thread(
                 sqs.receive_message,
