@@ -4,6 +4,10 @@ import boto3
 import random
 import ssl
 import os
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+
 from src.servicios import servicio_tramite
 from src.db import transacciones
 from src.clientes import inpi_marcas
