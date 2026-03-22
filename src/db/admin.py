@@ -25,7 +25,7 @@ def reset_database():
         archivos_sql = [
             "reset_db.sql",                 # 1. Estructura (Tablas vacías)
             "poblar_dim_clases_subitems.sql",      # 2. Datos Niza (API INPI)
-            "poblar_dim_tipo_marca.sql" # 3. Datos Niza (Manuales/Complementarios)
+            "poblar_dimensiones.sql" # 3. Datos Niza (Manuales/Complementarios)
         ]
 
         with conn.cursor() as cur:

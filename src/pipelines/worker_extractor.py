@@ -3,16 +3,21 @@ import aiohttp
 import boto3
 import random
 import ssl
+import os
 from src.servicios import servicio_tramite
 from src.db import transacciones
 from src.clientes import inpi_marcas
 from src.parsers import html_parser
 from src.config import settings
+from src.db.metricas_ingesta import metricas
+import time
 
-# --- CONFIGURACIÓN DE PRUEBA SEGURA ---
-SQS_QUEUE_URL = settings.SQS_QUEUE_URL
-CONCURRENCIA_MAXIMA = 5   # FRENO DE MANO: Solo 2 peticiones a la vez
-MAX_INTENTOS = 3
+SQS_QUEUE_URL       = settings.SQS_QUEUE_URL
+CONCURRENCIA_MAXIMA = int(os.environ.get("CONCURRENCIA", "5"))
+DELAY_MIN           = float(os.environ.get("DELAY_MIN", "1.0"))
+DELAY_MAX           = float(os.environ.get("DELAY_MAX", "3.0"))
+PROXY_URL           = os.environ.get("PROXY_URL", None)
+MAX_INTENTOS        = 3
 
 sqs = boto3.client(
     'sqs',
@@ -30,35 +35,39 @@ def crear_ssl_context():
 
 async def extraer_datos_acta_async(session, nro_acta, receipt_handle, sem):
     async with sem:
-        # 🛑 PAUSA ARTIFICIAL (Antiban INPI) 🛑
-        # Espera entre 1 y 3 segundos antes de golpear al portal
-        await asyncio.sleep(random.uniform(1, 3))
-        
+        # ← CAMBIO 1: antes era hardcoded random.uniform(1, 3)
+        await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
         for intento in range(1, MAX_INTENTOS + 1):
             try:
-                html = await inpi_marcas.obtener_html_detalle(session, nro_acta)
+                # ← CAMBIO 2: se agrega proxy=PROXY_URL (None = sin proxy, aiohttp lo ignora)
+                html = await inpi_marcas.obtener_html_detalle(session, nro_acta, proxy=PROXY_URL)
                 if html:
                     datos = html_parser.parsear_detalle_html(html, nro_acta)
                     if datos:
                         return {"datos": datos, "handle": receipt_handle, "nro": nro_acta}
             except Exception as e:
                 print(f"⚠️ Error red acta {nro_acta} (intento {intento}): {e}")
+                metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
+
+
 
             if intento < MAX_INTENTOS:
                 await asyncio.sleep(random.uniform(0.1, 0.5))
 
-        return None
+        return None  # SQS reintentará; tras 3 recibos va a la DLQ automáticamente
 
 async def worker_sqs():
     sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
-    print(f"🚀 Worker EC2 (MODO SEGURO) iniciado. Concurrencia: {CONCURRENCIA_MAXIMA}")
+    print(f"🚀 Worker iniciado | Concurrencia: {CONCURRENCIA_MAXIMA} | Delay: {DELAY_MIN}–{DELAY_MAX}s | Proxy: {'sí' if PROXY_URL else 'no'}")
+
+    transacciones.inicializar_cache_desde_db()
 
     ssl_ctx = crear_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=CONCURRENCIA_MAXIMA)
 
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
-            # Pedir a SQS usando to_thread para no congelar otras actas en proceso
             response = await asyncio.to_thread(
                 sqs.receive_message,
                 QueueUrl=SQS_QUEUE_URL,
@@ -77,24 +86,27 @@ async def worker_sqs():
             ]
             resultados = await asyncio.gather(*tasks)
 
-            lote_para_db = [r['datos'] for r in resultados if r is not None]
+            lote_para_db    = [r['datos'] for r in resultados if r is not None]
             handles_exitosos = [r['handle'] for r in resultados if r is not None]
 
-            print(f"📦 Lote procesado: {len(lote_para_db)} OK | {len(resultados) - len(lote_para_db)} fallidos")
+            print(f"📦 Lote: {len(lote_para_db)} OK | {len(resultados) - len(lote_para_db)} fallidos (irán a DLQ)")
 
             if lote_para_db:
-                # Guardar en base de datos usando un hilo separado
-                # (Asumo que usás la función iterativa o un batch insert en transacciones.py)
-                exito_db = await asyncio.to_thread(transacciones.guardar_lote_tramites, lote_para_db)
-                
+                t_db = time.time()
+                exito_db = await asyncio.to_thread(transacciones.guardar_lote_tramites_completo, lote_para_db)
+                metricas.registrar_lote_db(len(lote_para_db), time.time() - t_db)
+
                 if exito_db:
                     entries = [{'Id': str(i), 'ReceiptHandle': h} for i, h in enumerate(handles_exitosos)]
                     await asyncio.to_thread(sqs.delete_message_batch, QueueUrl=SQS_QUEUE_URL, Entries=entries)
-                    print(f"✅ Lote guardado y borrado de SQS exitosamente.")
+                    print(f"✅ Guardado y borrado de SQS.")
                 else:
-                    print("❌ Falló el guardado en DB, volviendo a la cola.")
+                    print("❌ Falló el guardado en DB — los mensajes vuelven a la cola.")
             else:
                 print("⚠️ Lote vacío, nada para guardar.")
+
+            if metricas.lotes_db % 50 == 0 and metricas.lotes_db > 0:
+                metricas.imprimir_resumen()
 
 if __name__ == "__main__":
     asyncio.run(worker_sqs())

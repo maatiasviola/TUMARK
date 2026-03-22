@@ -78,10 +78,12 @@ from dateutil.relativedelta import relativedelta
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from src.clientes import inpi_marcas
+from src.config import settings
 
-from src.config import settings  # Importás tu archivo de configuración
+# ← Estas dos líneas ya las tienen, solo asegurarse que estén una sola vez
+fecha_inicio      = datetime.fromisoformat(os.environ.get("DATE_FROM", "2024-01-01"))
+fecha_actual_tope = datetime.fromisoformat(os.environ.get("DATE_TO",   "2024-01-07"))
 
-# Crear el cliente usando las variables del .env
 sqs = boto3.client(
     'sqs',
     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
@@ -90,56 +92,39 @@ sqs = boto3.client(
 )
 
 SQS_QUEUE_URL = settings.SQS_QUEUE_URL
-
-
 TAMANO_PAGINA = 1000
 
 def enviar_a_sqs_batch(lista_ids):
-    """Envía IDs a SQS en lotes de 10 y reintenta automáticamente los fallidos"""
     for i in range(0, len(lista_ids), 10):
         batch = lista_ids[i:i + 10]
-        
-        # Usamos el mismo nro de acta como 'Id' del mensaje para facilitar el seguimiento
         entries = [{'Id': str(nro), 'MessageBody': str(nro)} for nro in batch]
-        
-        max_reintentos = 3
-        for intento in range(max_reintentos):
+
+        for intento in range(3):
             if not entries:
-                break  # Si la lista de entries está vacía, ya se enviaron todos
-                
+                break
             response = sqs.send_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=entries)
-            
-            # AWS devuelve una lista 'Failed' si algún mensaje del lote no entró
             fallidos = response.get('Failed', [])
-            
             if not fallidos:
-                break  # Todo OK, salimos del bucle de reintentos
-                
-            print(f"   ⚠️ {len(fallidos)} mensajes fallaron en SQS. Reintentando (Intento {intento + 1})...")
-            
-            # Filtramos la lista original para quedarnos SOLO con los que fallaron
-            ids_fallidos = [f['Id'] for f in fallidos]
+                break
+            print(f"   ⚠️ {len(fallidos)} mensajes fallaron en SQS. Reintentando ({intento + 1}/3)...")
+            ids_fallidos = {f['Id'] for f in fallidos}
             entries = [e for e in entries if e['Id'] in ids_fallidos]
-            
-            time.sleep(1) # Pequeña pausa de red antes de volver a intentar
+            time.sleep(1)
 
 async def poblar_sqs_por_mes():
-    print("🚀 INICIANDO SEMBRADO EN SQS")
-    
-    fecha_inicio = datetime(2023, 10, 1) 
-    fecha_actual_tope = datetime(2023, 10, 7)
+    print(f"🚀 INICIANDO SEMBRADO | {fecha_inicio.date()} → {fecha_actual_tope.date()}")
     cursor_fecha = fecha_inicio
 
     async with aiohttp.ClientSession() as session:
         while cursor_fecha < fecha_actual_tope:
-            proximo_mes = cursor_fecha + relativedelta(months=1)
+            proximo_mes      = cursor_fecha + relativedelta(months=1)
             fecha_hasta_lote = min(proximo_mes, fecha_actual_tope)
-            
+
             s_desde = cursor_fecha.strftime("%d/%m/%Y")
             s_hasta = (fecha_hasta_lote + timedelta(days=1)).strftime("%d/%m/%Y")
-            
-            print(f"📅 Consultando: {s_desde} al {s_hasta}")
-            
+
+            print(f"📅 Consultando: {s_desde} → {s_hasta}")
+
             offset = 0
             while True:
                 payload = {
@@ -147,19 +132,21 @@ async def poblar_sqs_por_mes():
                     "Fecha_IngresoDesde": s_desde, "Fecha_IngresoHasta": s_hasta,
                     "limit": TAMANO_PAGINA, "offset": offset
                 }
-
                 lista_ids = await inpi_marcas.obtener_lista_actas(session, payload)
-                if not lista_ids: break
+                if not lista_ids:
+                    break
 
-                # Enviar a SQS
                 enviar_a_sqs_batch(lista_ids)
-                print(f"   ↳ Lote de {len(lista_ids)} IDs enviado a SQS.")
+                print(f"   ↳ {len(lista_ids)} IDs enviados a SQS.")
 
-                if len(lista_ids) < TAMANO_PAGINA: break
+                if len(lista_ids) < TAMANO_PAGINA:
+                    break
                 offset += TAMANO_PAGINA
                 await asyncio.sleep(0.2)
 
             cursor_fecha = fecha_hasta_lote + timedelta(days=1)
+
+    print("🏁 Sembrado finalizado.")
 
 if __name__ == "__main__":
     asyncio.run(poblar_sqs_por_mes())

@@ -3,130 +3,296 @@ import hashlib
 import json
 from src.db.conexion import get_pg_conn
 from psycopg2.extras import execute_values
+from src.db.conexion import get_pg_conn, get_supabase
 
-cache_dimensiones = {}
+# El "cerebro" de la memoria rápida
+cache_dimensiones = {
+    "dim_tipo_marca": {},
+    "dim_estado_tramite_acta": {},
+    "dim_tipos_vistas": {}
+}
 
-def obtener_id_dimension_fast(tabla, col_desc, valor):
-    if not valor: return None
-    valor = str(valor).strip().upper()
-    key = f"{tabla}_{valor}"
-    
-    if key in cache_dimensiones:
-        return cache_dimensiones[key]
-    
-    # Si no está en caché, usamos la lógica original pero guardamos el resultado
-    res_id = obtener_id_dimension(tabla, col_desc, valor)
-    if res_id:
-        cache_dimensiones[key] = res_id
-    return res_id
-
-def guardar_lote_tramites(lista_datos_raw):
-    """
-    Recibe una lista de diccionarios (lote de SQS).
-    Procesa titulares y marcas individualmente (porque son pocos),
-    pero prepara las ACTAS para un insert masivo.
-    """
-    if not lista_datos_raw: return
-    
+def inicializar_cache_desde_db():
+    """Carga las dimensiones desde la DB a la memoria al iniciar."""
     conn = get_pg_conn()
-    actas_para_insertar = []
-    
     try:
-        for datos_raw in lista_datos_raw:
-            # Reutilizamos tu lógica de limpieza
-            datos = limpiar_datos_para_db(datos_raw)
-            id_imagen = datos.get('id_imagen_procesada') # Asumiendo que viene del extractor
+        with conn.cursor() as cur:
+            # Cargamos cada tabla
+            cur.execute("SELECT id_tipo_marca, tipo_marca FROM dim_tipo_marca")
+            cache_dimensiones["dim_tipo_marca"] = {row[1].upper(): row[0] for row in cur.fetchall()}
             
-            # 1. Gestionar Titulares (Mantenemos la lógica actual por seguridad)
-            # Nota: Esto se podría optimizar más, pero el grueso es el acta.
-            ids_titulares_solo = []
-            for t in datos.get('titulares', []):
-                # ... (aquí va tu lógica actual de titulares para obtener ids)
-                # Por brevedad, asumo que ya tienes los ids_titulares_solo
-                pass
-
-            # 2. Gestionar Marca e Identidad
-            tipo_texto = datos.get('tipo_marca_texto') 
-            id_tipo_real = obtener_id_dimension_fast("dim_tipo_marca", "tipo_marca", tipo_texto)
+            cur.execute("SELECT id_estado_tramite, estado_tramite FROM dim_estado_tramite_acta")
+            cache_dimensiones["dim_estado_tramite_acta"] = {row[1].upper(): row[0] for row in cur.fetchall()}
             
-            ids_titulares_sorted = sorted(list(set(ids_titulares_solo)))
-            identidad_hash = calcular_identidad_marca(
-                datos.get('denominacion'), id_tipo_real, id_imagen, ids_titulares_sorted
-            )
+            cur.execute("SELECT id_tipo_vista, tipo_vista FROM dim_tipos_vistas")
+            cache_dimensiones["dim_tipos_vistas"] = {row[1].upper(): row[0] for row in cur.fetchall()}
+            
+        print(f"🧠 Caché sincronizada: {len(cache_dimensiones['dim_estado_tramite_acta'])} estados cargados.")
+    finally:
+        conn.close()
 
-            # Insert/Select Marca (Individual para manejar el hash)
-            id_marca = gestionar_id_marca(datos, id_tipo_real, id_imagen, ids_titulares_sorted, identidad_hash)
+def obtener_id_dimension(tabla, col_desc, valor_raw):
+    """Busca en memoria y si no existe, inserta en DB y actualiza memoria."""
+    # Lógica de "EN TRAMITE"
+    if not valor_raw or valor_raw.strip() == "":
+        valor = "EN TRAMITE"
+    else:
+        valor = valor_raw.strip().replace("[", "").replace("]", "").upper()
 
-            # 3. Preparar tupla para el ACTA (Bulk Insert)
-            nro_res = None
-            if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit():
-                nro_res = int(datos['nro_resolucion'])
+    # 1. Check memoria
+    if valor in cache_dimensiones[tabla]:
+        return cache_dimensiones[tabla][valor]
 
-            # Orden exacto de las columnas en tu tabla 'actas'
-            acta_tupla = (
-                datos['nro_acta'],
-                id_marca,
-                int(datos.get('id_clase', 0)) if datos.get('id_clase') else None,
-                datos.get('id_estado_procesado'),
-                id_imagen,
-                id_tipo_real,
-                datos.get('denominacion'),
-                datos.get('fecha_ingreso'),
-                datos.get('fecha_vencimiento'),
-                nro_res,
-                datos.get('fecha_disposicion'),
-                datos.get('es_clase_completa')
-            )
-            actas_para_insertar.append(acta_tupla)
+    # 2. Fallback: Insertar en DB si es nuevo
+    print(f"✨ Valor nuevo en {tabla}: {valor}. Registrando en DB...")
+    sb = get_supabase()
+    res = sb.table(tabla).upsert({col_desc: valor}, on_conflict=col_desc).execute()
+    
+    if res.data:
+        new_id = list(res.data[0].values())[0]
+        cache_dimensiones[tabla][valor] = new_id
+        return new_id
+    return None
 
-        # --- EJECUCIÓN DEL BULK INSERT ---
-        if actas_para_insertar:
-            with conn.cursor() as cur:
-                # 🛑 NOTA: Quitamos los paréntesis de VALUES (%) y dejamos solo %s
-                query_actas = """
+def guardar_lote_tramites_completo(lista_datos_raw):
+    if not lista_datos_raw:
+        return True
+
+    conn = get_pg_conn()
+
+    try:
+        with conn.cursor() as cur:
+
+            # ── Estructuras en memoria ─────────────────────────────────────
+            lista_datos_procesados  = []   # ← FIX: copia enriquecida, reemplaza iterar lista_datos_raw
+            marcas_para_insertar    = {}
+            actas_para_insertar     = []
+            titulares_a_vincular    = []
+            oposiciones_para_insertar = []
+            vistas_para_insertar    = []
+
+            # ─────────────────────────────────────────────────────────────────
+            # FASE 1 — Preparación y titulares
+            # Todos los titulares se resuelven acá con SQL directo (sin Supabase HTTP).
+            # Al final guardamos la copia enriquecida en lista_datos_procesados.
+            # ─────────────────────────────────────────────────────────────────
+            for datos_raw in lista_datos_raw:
+                datos = limpiar_datos_para_db(datos_raw)
+
+                ids_titulares_acta = []
+                for t in datos.get('titulares', []):
+                    id_titular = _obtener_o_crear_titular_sql(cur, t)
+                    if id_titular:
+                        ids_titulares_acta.append(id_titular)
+                        titulares_a_vincular.append((
+                            datos['nro_acta'], id_titular, t.get('porcentaje', 100.0)
+                        ))
+
+                ids_titulares_sorted = sorted(list(set(ids_titulares_acta)))
+
+                # Dimensiones desde caché en memoria — cero peticiones a la DB
+                id_tipo   = obtener_id_dimension("dim_tipo_marca", "tipo_marca", datos.get('tipo_marca_texto'))
+                id_estado = obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos.get('estado_tramite'))
+                id_img    = datos.get('id_imagen')
+
+                identidad_hash = calcular_identidad_marca(
+                    datos.get('denominacion'), id_tipo, id_img, ids_titulares_sorted
+                )
+
+                if identidad_hash not in marcas_para_insertar:
+                    marcas_para_insertar[identidad_hash] = (
+                        datos.get('denominacion'), ids_titulares_sorted, id_img, id_tipo, identidad_hash
+                    )
+
+                # FIX: enriquecer la copia y guardarla — ya no iteramos lista_datos_raw después de acá
+                datos['_identidad_hash'] = identidad_hash
+                datos['_id_tipo']        = id_tipo
+                datos['_id_estado']      = id_estado
+                lista_datos_procesados.append(datos)
+
+            # ─────────────────────────────────────────────────────────────────
+            # FASE 2 — Bulk upsert de Marcas (1 sola query para todo el lote)
+            # ─────────────────────────────────────────────────────────────────
+            map_hash_idmarca = {}
+            if marcas_para_insertar:
+                execute_values(cur, """
+                    INSERT INTO marcas (denominacion, ids_titulares, id_imagen, id_tipo_marca, identidad_hash)
+                    VALUES %s
+                    ON CONFLICT (identidad_hash) DO UPDATE SET denominacion = EXCLUDED.denominacion
+                    RETURNING identidad_hash, id_marca;
+                """, list(marcas_para_insertar.values()))
+
+                for row in cur.fetchall():
+                    map_hash_idmarca[row[0]] = row[1]
+
+            # ─────────────────────────────────────────────────────────────────
+            # FASE 3 — Bulk upsert de Actas (1 sola query para todo el lote)
+            # FIX: ahora itera lista_datos_procesados, que sí tiene _identidad_hash
+            # ─────────────────────────────────────────────────────────────────
+            for datos in lista_datos_procesados:
+                id_m    = map_hash_idmarca.get(datos['_identidad_hash'])
+                nro_res = int(datos['nro_resolucion']) \
+                          if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit() \
+                          else None
+
+                actas_para_insertar.append((
+                    datos['nro_acta'], id_m, datos.get('id_clase'), datos['_id_estado'],
+                    datos.get('id_imagen'), datos['_id_tipo'], datos.get('denominacion'),
+                    datos.get('fecha_ingreso'), datos.get('fecha_vencimiento'),
+                    nro_res, datos.get('fecha_disposicion'), datos.get('es_clase_completa')
+                ))
+
+            map_nroacta_idacta = {}
+            if actas_para_insertar:
+                execute_values(cur, """
                     INSERT INTO actas (
-                        nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen, 
-                        id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento, 
+                        nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen,
+                        id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento,
                         nro_resolucion, fecha_disposicion, es_clase_completa
                     ) VALUES %s
                     ON CONFLICT (nro_acta) DO UPDATE SET
                         id_estado_tramite = EXCLUDED.id_estado_tramite,
-                        id_marca = EXCLUDED.id_marca,
-                        denominacion = EXCLUDED.denominacion,
+                        id_marca          = EXCLUDED.id_marca,
+                        denominacion      = EXCLUDED.denominacion,
                         fecha_vencimiento = EXCLUDED.fecha_vencimiento,
-                        nro_resolucion = EXCLUDED.nro_resolucion,
-                        fecha_disposicion = EXCLUDED.fecha_disposicion;
-                """
-                # execute_values se encarga de expandir el %s en (val1, val2), (val3, val4)...
-                execute_values(cur, query_actas, actas_para_insertar)
-                conn.commit()
-                print(f"   🚀 Lote de {len(actas_para_insertar)} actas insertado con éxito.")
-                
-            return True
+                        nro_resolucion    = EXCLUDED.nro_resolucion,
+                        fecha_disposicion = EXCLUDED.fecha_disposicion
+                    RETURNING nro_acta, id_acta;
+                """, actas_para_insertar)
+
+                for row in cur.fetchall():
+                    map_nroacta_idacta[row[0]] = row[1]
+
+            # ─────────────────────────────────────────────────────────────────
+            # FASE 4 — Bulk upsert de Actas_Titulares (1 sola query)
+            # ─────────────────────────────────────────────────────────────────
+            if titulares_a_vincular:
+                execute_values(cur, """
+                    INSERT INTO actas_titulares (nro_acta, id_titular, porcentaje)
+                    VALUES %s
+                    ON CONFLICT (nro_acta, id_titular) DO UPDATE SET porcentaje = EXCLUDED.porcentaje;
+                """, titulares_a_vincular)
+
+            # ─────────────────────────────────────────────────────────────────
+            # FASE 5 — Bulk upsert de Oposiciones (1 sola query)
+            # FIX: itera lista_datos_procesados
+            # ─────────────────────────────────────────────────────────────────
+            map_acta_nro_opo_idopo = {}
+
+            for datos in lista_datos_procesados:
+                id_a_interno = map_nroacta_idacta.get(datos['nro_acta'])
+                if not id_a_interno:
+                    continue
+                for o in datos.get('oposiciones', []):
+                    oposiciones_para_insertar.append((
+                        id_a_interno,
+                        o.get('Numero'),
+                        o.get('Oponente'),
+                        o.get('Fecha_Presentacion'),
+                        o.get('Fundamento'),
+                        o.get('Fecha_Levantamiento')
+                    ))
+
+            if oposiciones_para_insertar:
+                execute_values(cur, """
+                    INSERT INTO oposiciones (
+                        id_acta, nro_oposicion, nombre_oponente,
+                        fecha_presentacion, fundamento, fecha_levantamiento
+                    ) VALUES %s
+                    ON CONFLICT (id_acta, nro_oposicion) DO UPDATE SET
+                        nombre_oponente    = EXCLUDED.nombre_oponente,
+                        fecha_levantamiento = EXCLUDED.fecha_levantamiento
+                    RETURNING id_acta, nro_oposicion, id_oposicion;
+                """, oposiciones_para_insertar)
+
+                for row in cur.fetchall():
+                    map_acta_nro_opo_idopo[(row[0], row[1])] = row[2]
+
+            # ─────────────────────────────────────────────────────────────────
+            # FASE 6 — Bulk insert de Vistas (1 sola query)
+            # FIX: itera lista_datos_procesados
+            # ─────────────────────────────────────────────────────────────────
+            for datos in lista_datos_procesados:
+                id_a_interno = map_nroacta_idacta.get(datos['nro_acta'])
+                if not id_a_interno:
+                    continue
+                for v in datos.get('vistas', []):
+                    id_tv = obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'))
+                    id_opo_vinculada = map_acta_nro_opo_idopo.get(
+                        (id_a_interno, v.get('nro_oposicion_vinculada'))
+                    )
+                    vistas_para_insertar.append((
+                        id_a_interno,
+                        id_opo_vinculada,
+                        id_tv,
+                        v.get('Fecha_Vista'),
+                        v.get('Fecha_Vencimiento'),
+                        v.get('Fecha_Contestacion')
+                    ))
+
+            if vistas_para_insertar:
+                execute_values(cur, """
+                    INSERT INTO vistas (
+                        id_acta, id_oposicion, id_tipo_vista,
+                        fecha, fecha_vencimiento, fecha_contestacion
+                    ) VALUES %s;
+                """, vistas_para_insertar)
+
+            conn.commit()
+            print(
+                f"🚀 LOTE: {len(actas_para_insertar)} actas · "
+                f"{len(oposiciones_para_insertar)} oposiciones · "
+                f"{len(vistas_para_insertar)} vistas"
+            )
+
+        # ─────────────────────────────────────────────────────────────────
+        # FASE 7 — Productos (fuera de la transacción, usa Supabase HTTP)
+        # FIX: itera lista_datos_procesados
+        # ─────────────────────────────────────────────────────────────────
+        for datos in lista_datos_procesados:
+            id_a_interno = map_nroacta_idacta.get(datos['nro_acta'])
+            if id_a_interno and datos.get('id_clase'):
+                procesar_productos(
+                    id_a_interno,
+                    int(datos['id_clase']),
+                    datos.get('proteccion', ''),
+                    datos.get('limitacion', '')
+                )
+
+        return True
 
     except Exception as e:
         conn.rollback()
-        print(f"   ❌ ERROR EN BULK INSERT: {e}")
-        # ¡Y FALTABA ESTO! Falló, devolvemos False
-        return False 
+        print(f"❌ ERROR CRÍTICO EN BULK INSERT: {e}")
+        import traceback; traceback.print_exc()
+        return False
     finally:
         conn.close()
 
-# Función auxiliar para no ensuciar el loop masivo
-def gestionar_id_marca(datos, id_tipo, id_img, ids_tits, ident_hash):
-    sb = get_supabase()
-    res = sb.table("marcas").select("id_marca").eq("identidad_hash", ident_hash).execute()
-    if res.data: return res.data[0]['id_marca']
-    
-    nueva = {
-        "denominacion": datos.get('denominacion'),
-        "ids_titulares": ids_tits,
-        "id_imagen": id_img,
-        "id_tipo_marca": id_tipo,
-        "identidad_hash": ident_hash 
-    }
-    res_ins = sb.table("marcas").insert(nueva).execute()
-    return res_ins.data[0]['id_marca'] if res_ins.data else None
+# Helper SQL super rápido para titulares
+def _obtener_o_crear_titular_sql(cur, t):
+    cuit = int(t['cuit_cuil']) if t.get('cuit_cuil') else None
+    nombre = t.get('nombre', 'DESCONOCIDO').strip().upper()
+    pais = t.get('pais', 'ARGENTINA').upper()
+
+    if cuit:
+        cur.execute("""
+            INSERT INTO titulares (cuit_cuil, nombre, pais) VALUES (%s, %s, %s)
+            ON CONFLICT (cuit_cuil) DO UPDATE SET nombre = EXCLUDED.nombre
+            RETURNING id_titular;
+        """, (cuit, nombre, pais))
+    else:
+        cur.execute("""
+            INSERT INTO titulares (nombre, pais) VALUES (%s, %s)
+            ON CONFLICT (nombre) DO NOTHING
+            RETURNING id_titular;
+        """, (nombre, pais))
+        if cur.rowcount == 0:
+            cur.execute("SELECT id_titular FROM titulares WHERE nombre = %s;", (nombre,))
+            
+    res = cur.fetchone()
+    return res[0] if res else None
+
 
 def buscar_imagen_por_hash(image_hash):
     if not image_hash: return None
@@ -163,56 +329,6 @@ def insertar_imagen_hash(url, image_hash):
 
 # --- 1. HELPERS: Dimensiones y Estados ---
 
-def obtener_id_dimension(tabla, col_desc, valor):
-    if not valor: return None
-    sb = get_supabase()
-    valor = str(valor).strip()
-    
-    try:
-        # Busca dinámicamente
-        res = sb.table(tabla).select("*").eq(col_desc, valor).execute()
-        if res.data and len(res.data) > 0:
-            # Blindaje: asegurarse de que existe el índice 0
-            return list(res.data[0].values())[0]
-            
-        # Si no existe, insertar
-        res_ins = sb.table(tabla).insert({col_desc: valor}).execute()
-        if res_ins.data and len(res_ins.data) > 0:
-            return list(res_ins.data[0].values())[0]
-            
-    except Exception as e:
-        # Fallback de último recurso: intentar buscar una vez más
-        try:
-            res = sb.table(tabla).select("*").eq(col_desc, valor).execute()
-            if res.data: return list(res.data[0].values())[0]
-        except: pass
-        print(f"   ⚠️ Error obteniendo ID dimensión {tabla}: {e}")
-    
-    return None
-
-def obtener_id_estado(descripcion):
-    # Si ambos son None, no podemos determinar estado
-    if not descripcion: return None
-
-    desc = descripcion.strip().upper() if descripcion else "SIN DESCRIPCION"
-    sb = get_supabase()
-    
-    try:
-        res = sb.table("dim_estado_tramite_acta")\
-            .select("id_estado_tramite")\
-            .eq("estado_tramite", desc)\
-            .execute()
-            
-        if res.data:
-            return res.data[0]['id_estado_tramite']
-        
-        data = {"estado_tramite": desc}
-        res_ins = sb.table("dim_estado_tramite_acta").insert(data).execute()
-        if res_ins.data:
-            return res_ins.data[0]['id_estado_tramite']
-    except Exception as e:
-        print(f"   ⚠️ Error gestionando estado: {e}")
-        return None
 
 def _fetch_all_subitems_clase(sb, id_clase):
     all_ids = set()
@@ -351,201 +467,117 @@ def limpiar_datos_para_db(datos):
     return copia
 
 def guardar_tramite_completo(datos_raw, id_imagen=None):
-    # Envolvemos TODO en un try/except grande para evitar crash del pipeline
+    """
+    Versión ÓPTIMA para procesar un solo acta (Simulaciones y Workers pequeños).
+    Guarda Titulares, Marcas, Actas, Oposiciones y Vistas en 1 sola transacción de base de datos.
+    """
+    datos = limpiar_datos_para_db(datos_raw)
+    conn = get_pg_conn()
+    
     try:
-        sb = get_supabase()
-        datos = limpiar_datos_para_db(datos_raw)
-        
-        # 1. TITULARES
-        ids_titulares_solo = []      
-        datos_vinculacion = []       
+        with conn.cursor() as cur:
+            # 1. Dimensiones ultrarrápidas desde caché
+            id_tipo = obtener_id_dimension("dim_tipo_marca", "tipo_marca", datos.get('tipo_marca_texto'))
+            id_estado = obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos.get('estado_tramite'))
+            
+            # 2. Titulares
+            ids_titulares_solo = []
+            datos_vinculacion = []
+            for t in datos.get('titulares', []):
+                id_titular = _obtener_o_crear_titular_sql(cur, t)
+                if id_titular:
+                    ids_titulares_solo.append(id_titular)
+                    datos_vinculacion.append((datos['nro_acta'], id_titular, t.get('porcentaje', 100.0)))
+                    
+            ids_titulares_sorted = sorted(list(set(ids_titulares_solo)))
+            
+            # 3. Marca (Inserción/Actualización y obtención de ID al vuelo)
+            identidad_hash = calcular_identidad_marca(datos.get('denominacion'), id_tipo, id_imagen, ids_titulares_sorted)
+            cur.execute("""
+                INSERT INTO marcas (denominacion, ids_titulares, id_imagen, id_tipo_marca, identidad_hash)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (identidad_hash) DO UPDATE SET denominacion = EXCLUDED.denominacion
+                RETURNING id_marca;
+            """, (datos.get('denominacion'), ids_titulares_sorted, id_imagen, id_tipo, identidad_hash))
+            id_marca = cur.fetchone()[0]
 
-        for t in datos.get('titulares', []):
-            cuit = int(t['cuit_cuil']) if t.get('cuit_cuil') else None
-            nombre = t.get('nombre', 'DESCONOCIDO').strip().upper()
-            pais = t.get('pais', 'ARGENTINA').upper()
-            porcentaje_real = t.get('porcentaje', 100.0)
-            
-            data_t = {"nombre": nombre, "cuit_cuil": cuit, "pais": pais}
-            
-            id_obtenido = None
-            try:
-                if cuit:
-                    res = sb.table("titulares").upsert(data_t, on_conflict="cuit_cuil").execute()
-                else:
-                    res = sb.table("titulares").upsert(data_t, on_conflict="nombre").execute()
+            # 4. Acta
+            nro_res = int(datos['nro_resolucion']) if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit() else None
+            cur.execute("""
+                INSERT INTO actas (
+                    nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen, 
+                    id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento, 
+                    nro_resolucion, fecha_disposicion, es_clase_completa
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (nro_acta) DO UPDATE SET
+                    id_estado_tramite = EXCLUDED.id_estado_tramite,
+                    id_marca = EXCLUDED.id_marca,
+                    denominacion = EXCLUDED.denominacion,
+                    fecha_vencimiento = EXCLUDED.fecha_vencimiento,
+                    nro_resolucion = EXCLUDED.nro_resolucion,
+                    fecha_disposicion = EXCLUDED.fecha_disposicion
+                RETURNING id_acta;
+            """, (
+                datos['nro_acta'], id_marca, datos.get('id_clase'), id_estado, id_imagen,
+                id_tipo, datos.get('denominacion'), datos.get('fecha_ingreso'), 
+                datos.get('fecha_vencimiento'), nro_res, datos.get('fecha_disposicion'), datos.get('es_clase_completa')
+            ))
+            id_acta_interno = cur.fetchone()[0]
+
+            # 5. Vinculación Actas-Titulares
+            if datos_vinculacion:
+                execute_values(cur, """
+                    INSERT INTO actas_titulares (nro_acta, id_titular, porcentaje)
+                    VALUES %s ON CONFLICT (nro_acta, id_titular) DO UPDATE SET porcentaje = EXCLUDED.porcentaje;
+                """, datos_vinculacion)
+
+            # 6. Oposiciones
+            map_nro_opo_idopo = {}
+            if datos.get('oposiciones'):
+                opos_data = [(id_acta_interno, o.get('Numero'), o.get('Oponente'), o.get('Fecha_Presentacion'), o.get('Fundamento'), o.get('Fecha_Levantamiento')) for o in datos['oposiciones']]
                 
-                if res.data: id_obtenido = res.data[0]['id_titular']
-            except Exception as e:
-                # Fallback de recuperación
-                try:
-                    q = sb.table("titulares").select("id_titular")
-                    q = q.eq("cuit_cuil", cuit) if cuit else q.eq("nombre", nombre)
-                    r_rescue = q.execute()
-                    if r_rescue.data: id_obtenido = r_rescue.data[0]['id_titular']
-                except: pass
-            
-            if id_obtenido:
-                ids_titulares_solo.append(id_obtenido)
-                datos_vinculacion.append({
-                    "id_titular": id_obtenido,
-                    "porcentaje": porcentaje_real
-                })
-
-        # 2. MARCA
-        id_marca = None
-        ids_titulares_sorted = sorted(list(set(ids_titulares_solo)))
-        
-        # CAMBIO: Usar tipo_marca_texto (string) para buscar ID (int)
-        tipo_texto = datos.get('tipo_marca_texto') 
-        id_tipo_real = obtener_id_dimension("dim_tipo_marca", "tipo_marca", tipo_texto)
-        
-        identidad_hash = calcular_identidad_marca(
-            datos.get('denominacion'), 
-            id_tipo_real, 
-            id_imagen, 
-            ids_titulares_sorted
-        )
-        
-        res_m = sb.table("marcas").select("id_marca").eq("identidad_hash", identidad_hash).execute()
-        
-        estado_marca_log = ""
-        if res_m.data:
-            id_marca = res_m.data[0]['id_marca']
-            estado_marca_log = "♻️ Existente"
-        else:
-            try:
-                nueva = {
-                    "denominacion": datos.get('denominacion'),
-                    "ids_titulares": ids_titulares_sorted,
-                    "id_imagen": id_imagen,
-                    "id_tipo_marca": id_tipo_real,
-                    "identidad_hash": identidad_hash 
-                }
-                res_ins = sb.table("marcas").insert(nueva).execute()
-                if res_ins.data: 
-                    id_marca = res_ins.data[0]['id_marca']
-                    estado_marca_log = "✨ Nueva"
-            except Exception as e:
-                print(f"   ⚠️ Error insertando marca: {e}")
-                # Reintento por si hubo race condition
-                try:
-                    res_retry = sb.table("marcas").select("id_marca").eq("identidad_hash", identidad_hash).execute()
-                    if res_retry.data: id_marca = res_retry.data[0]['id_marca']
-                except: pass
-
-        if not id_marca:
-            print("   ❌ Error crítico: Sin marca. Saltando.")
-            return False
-
-        # 3. ACTA
-        id_acta_interno = None 
-        try:
-            nro_res = None
-            if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit():
-                nro_res = int(datos['nro_resolucion'])
-
-            acta_data = {
-                "nro_acta": datos['nro_acta'],
-                "id_marca": id_marca,
-                "id_clase": int(datos.get('id_clase', 0)) if datos.get('id_clase') else None,
-                "id_estado_tramite": datos.get('id_estado_procesado'),
-                "id_imagen": id_imagen,
-                "id_tipo_marca": id_tipo_real, 
-                "denominacion": datos.get('denominacion'),
-                "fecha_ingreso": datos.get('fecha_ingreso'),
-                "fecha_vencimiento": datos.get('fecha_vencimiento'),
-                "nro_resolucion": nro_res,
-                "fecha_disposicion": datos.get('fecha_disposicion'),
-                "es_clase_completa": datos.get('es_clase_completa')
-            }
-            
-            res_acta = sb.table("actas").upsert(acta_data, on_conflict="nro_acta").execute()
-            
-            if not res_acta.data:
-                print("   ❌ Error: No se guardó el acta (respuesta vacía).")
-                return False
+                # Fetch=True permite recuperar los IDs generados de las oposiciones
+                res_opos = execute_values(cur, """
+                    INSERT INTO oposiciones (id_acta, nro_oposicion, nombre_oponente, fecha_presentacion, fundamento, fecha_levantamiento)
+                    VALUES %s ON CONFLICT (id_acta, nro_oposicion) DO UPDATE SET
+                        nombre_oponente = EXCLUDED.nombre_oponente,
+                        fecha_levantamiento = EXCLUDED.fecha_levantamiento
+                    RETURNING nro_oposicion, id_oposicion;
+                """, opos_data, fetch=True)
                 
-            id_acta_interno = res_acta.data[0]['id_acta']
+                if res_opos:
+                    for row in res_opos:
+                        map_nro_opo_idopo[row[0]] = row[1]
 
-        except Exception as e:
-            print(f"   ⚠️ Error guardando Acta: {e}")
-            return False
+            # 7. Vistas
+            if datos.get('vistas'):
+                vistas_data = []
+                for v in datos['vistas']:
+                    id_tv = obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'))
+                    # Buscamos si esta vista tiene una oposición vinculada de las que acabamos de insertar
+                    id_opo_vinc = map_nro_opo_idopo.get(int(v.get('nro_oposicion_vinculada'))) if v.get('nro_oposicion_vinculada') else None
+                    
+                    vistas_data.append((id_acta_interno, id_opo_vinc, id_tv, v.get('Fecha_Vista'), v.get('Fecha_Vencimiento'), v.get('Fecha_Contestacion')))
+                
+                execute_values(cur, """
+                    INSERT INTO vistas (id_acta, id_oposicion, id_tipo_vista, fecha, fecha_vencimiento, fecha_contestacion)
+                    VALUES %s;
+                """, vistas_data)
 
-        # 4. SUBITEMS (Productos)
+            # ¡Confirmamos toda la transacción!
+            conn.commit()
+            
+        # 8. Subitems (Fuera de la transacción estricta porque Supabase demora más)
         if datos.get('id_clase'):
-             procesar_productos(
-                id_acta_interno,
-                int(datos['id_clase']), 
-                datos.get('proteccion', ''),
-                datos.get('limitacion', '')
-            )
-
-        # 5. VINCULAR ACTA-TITULARES
-        if datos_vinculacion:
-            registros_at = []
-            for item in datos_vinculacion:
-                registros_at.append({
-                    "nro_acta": datos['nro_acta'],
-                    "id_titular": item['id_titular'],
-                    "porcentaje": item['porcentaje'] 
-                })
-            try:
-                sb.table("actas_titulares").upsert(registros_at, on_conflict="nro_acta, id_titular").execute()
-            except Exception as e: print(f"   ⚠️ Error vinculando titulares: {e}")
-
-        # 6. OPOSICIONES
-        if 'oposiciones' in datos and datos['oposiciones']:
-            for opo in datos['oposiciones']:
-                try:
-                    sb.table("oposiciones").upsert({
-                        "id_acta": id_acta_interno,
-                        "nro_oposicion": opo.get('Numero'),             
-                        "nombre_oponente": opo.get('Oponente'),         
-                        "fecha_presentacion": opo.get('Fecha_Presentacion'), 
-                        "fundamento": opo.get('Fundamento'),
-                        "fecha_levantamiento": opo.get('Fecha_Levantamiento')
-                    }, on_conflict="id_acta, nro_oposicion").execute()
-                except Exception as e: print(f"   ⚠️ Error insertando oposición: {e}")
-
-        # 7. VISTAS Y NOTIFICACIONES
-        if 'vistas' in datos and datos['vistas']:
-            for vis in datos['vistas']:
-                try:
-                    id_tipo_vista = obtener_id_dimension("dim_tipos_vistas", "tipo_vista", vis.get('Tipo'))
-                    
-                    id_opo = None
-                    nro_vinculado = vis.get('nro_oposicion_vinculada')
-                    
-                    if nro_vinculado:
-                        try:
-                            res_o = sb.table("oposiciones").select("id_oposicion")\
-                                .eq("id_acta", id_acta_interno)\
-                                .eq("nro_oposicion", int(nro_vinculado))\
-                                .execute()
-                            if res_o.data: id_opo = res_o.data[0]['id_oposicion']
-                        except: pass
-                    
-                    sb.table("vistas").insert({
-                        "id_acta": id_acta_interno,
-                        "id_oposicion": id_opo,
-                        "fecha": vis.get('Fecha_Vista'),
-                        "fecha_contestacion": vis.get('Fecha_Contestacion'), 
-                        "id_tipo_vista": id_tipo_vista, 
-                        "fecha_vencimiento": vis.get('Fecha_Vencimiento')
-                    }).execute()
-
-                except Exception as e: print(f"   ⚠️ Error insertando vista: {e}")
-
-        # --- LOG FINAL ---
-        denominacion_log = datos.get('denominacion', 'S/D')
-        if denominacion_log: denominacion_log = denominacion_log[:20]
-        else: denominacion_log = "S/D"
-        
-        img_log = f"Img: {id_imagen}" if id_imagen else "Sin Img"
-        print(f"   ✅ [Acta: {datos['nro_acta']}] {denominacion_log:<20} | {img_log:<10} | Marca: {estado_marca_log}")
+            procesar_productos(id_acta_interno, int(datos['id_clase']), datos.get('proteccion', ''), datos.get('limitacion', ''))
+            
+        print(f" ✅ [Acta: {datos['nro_acta']}] Guardado ÓPTIMO completado exitosamente.")
         return True
 
     except Exception as e:
-        print(f"   ❌ CRASH EN TRAMITE COMPLETO: {e}")
+        conn.rollback()
+        print(f" ❌ CRASH EN TRAMITE COMPLETO: {e}")
         return False
+    finally:
+        conn.close()
+    

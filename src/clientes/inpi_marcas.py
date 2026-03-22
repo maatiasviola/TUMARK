@@ -1,6 +1,8 @@
 import aiohttp
 import asyncio
 import requests # Necesario para el fallback sincrónico de vistas
+from src.db.metricas_ingesta import metricas
+import time
 
 URL_GRILLA_MARCAS = "https://portaltramites.inpi.gob.ar/MarcasConsultas/GrillaMarcasAvanzada"
 URL_DETALLE_MARCA = "https://portaltramites.inpi.gob.ar/MarcasConsultas/Resultado"
@@ -28,6 +30,7 @@ async def obtener_lista_actas(session, payload):
     return []
 
 async def obtener_html_detalle(session, nro_acta, proxy=None):
+    t0 = time.time()
     """[ASYNC] Obtiene el HTML del detalle de una marca."""
     payload = {"acta": nro_acta}
     try:
@@ -39,8 +42,12 @@ async def obtener_html_detalle(session, nro_acta, proxy=None):
             timeout=30
         ) as response:
             if response.status == 200:
-                return await response.text()
+                html = await response.text()
+                metricas.registrar_html(html, time.time() - t0, response.status)
+
+                return html
     except Exception:
+        metricas.registrar_error(reintento=False)
         return None
     return None
 

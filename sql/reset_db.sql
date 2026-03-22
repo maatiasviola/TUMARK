@@ -35,9 +35,7 @@ CREATE TABLE dim_tipo_marca (
 
 CREATE TABLE dim_estado_tramite_acta ( 
     id_estado_tramite SERIAL PRIMARY KEY,
-    letra_estado_tramite VARCHAR(10),
-    estado_tramite VARCHAR(150),
-    CONSTRAINT uq_estado_completo UNIQUE (letra_estado_tramite, estado_tramite)
+    estado_tramite VARCHAR(150) UNIQUE -- Modificado para match perfecto con Python
 );
 
 CREATE TABLE dim_tipos_vistas (
@@ -66,12 +64,11 @@ CREATE TABLE marcas_imagenes (
     id_imagen SERIAL PRIMARY KEY,
     url_imagen TEXT, 
     embedding vector(1280), 
-    hash_imagen TEXT 
+    hash_imagen TEXT UNIQUE -- Sugerido UNIQUE por consistencia
 );
 
 -- Índices recomendados para búsqueda vectorial
 CREATE INDEX ON marcas_imagenes USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX ON marcas_imagenes(hash_imagen);
 
 CREATE TABLE titulares (
     id_titular SERIAL PRIMARY KEY,
@@ -82,14 +79,12 @@ CREATE TABLE titulares (
 
 CREATE TABLE marcas (
     id_marca SERIAL PRIMARY KEY,
-    id_tipo_marca INT REFERENCES dim_tipo_marca(id_tipo_marca), -- Agregado según diagrama
+    id_tipo_marca INT REFERENCES dim_tipo_marca(id_tipo_marca),
     id_imagen INT REFERENCES marcas_imagenes(id_imagen),
     ids_titulares INT[],
     denominacion TEXT,
-    identidad_hash BIGINT
+    identidad_hash BIGINT UNIQUE -- CLAVE PARA EL BULK INSERT MAGIC
 );
-
-CREATE INDEX IF NOT EXISTS idx_marcas_identidad_hash ON marcas(identidad_hash);
 
 -- TABLA ACTAS
 CREATE TABLE actas (
@@ -108,7 +103,6 @@ CREATE TABLE actas (
     es_clase_completa BOOLEAN
 );
 
--- TABLA AGREGADA (Estaba en diagrama, faltaba en script)
 CREATE TABLE actas_subitems_desnormalizados (
     id_acta INT REFERENCES actas(id_acta),
     subitem_desnormalizado TEXT
@@ -121,7 +115,7 @@ CREATE TABLE actas_subitems (
 );
 
 CREATE TABLE actas_titulares (
-    nro_acta INT REFERENCES actas(nro_acta), -- Diagrama usa nro_acta en la relación
+    nro_acta INT REFERENCES actas(nro_acta),
     id_titular INT REFERENCES titulares(id_titular),
     porcentaje DECIMAL,
     PRIMARY KEY (nro_acta, id_titular)
@@ -168,7 +162,7 @@ CREATE TABLE usuarios_titulares (
 );
 
 CREATE TABLE suscripciones (
-    id_usuario INT PRIMARY KEY REFERENCES usuarios(id_usuario), -- Corregido: Diagrama marca esto como PK
+    id_usuario INT PRIMARY KEY REFERENCES usuarios(id_usuario),
     id_plan INT REFERENCES planes(id_plan),
     fecha_inicio DATE DEFAULT CURRENT_DATE,
     fecha_fin DATE,
@@ -178,7 +172,7 @@ CREATE TABLE suscripciones (
 CREATE TABLE busquedas (
     id_busqueda SERIAL PRIMARY KEY,
     id_usuario INT REFERENCES usuarios(id_usuario),
-    fecha_busqueda DATE DEFAULT CURRENT_DATE, -- Diagrama dice 'date', script decía Timestamp
+    fecha_busqueda DATE DEFAULT CURRENT_DATE,
     id_tipo_busqueda INT REFERENCES dim_tipo_busqueda(id_tipo_busqueda),
     input_text TEXT,
     input_image_url TEXT,
@@ -188,36 +182,6 @@ CREATE TABLE busquedas (
 CREATE TABLE resultados_busquedas (
     id_busqueda INT REFERENCES busquedas(id_busqueda),
     id_marca INT REFERENCES marcas(id_marca),
-    score INT, -- Diagrama dice 'int', script decía decimal
+    score INT,
     PRIMARY KEY (id_busqueda, id_marca)
 );
-
--- ==========================================
--- 6. TRIGGERS (Opcional - Mantenido del original)
--- ==========================================
-
--- Nota: Este trigger actualiza el array de titulares en la tabla marcas
--- basado en actas_titulares. Es útil para mantener la integridad.
-
-CREATE OR REPLACE FUNCTION func_actualizar_titulares_marca() RETURNS TRIGGER AS $$
-DECLARE
-    v_id_marca INT;
-BEGIN
-    SELECT id_marca INTO v_id_marca FROM actas WHERE nro_acta = NEW.nro_acta;
-
-    IF v_id_marca IS NOT NULL THEN
-        UPDATE marcas 
-        SET ids_titulares = (
-            SELECT array_agg(DISTINCT id_titular) 
-            FROM actas_titulares at
-            JOIN actas a ON at.nro_acta = a.nro_acta
-            WHERE a.id_marca = v_id_marca
-        )
-        WHERE id_marca = v_id_marca;
-    END IF;
-    RETURN NULL;
-END; $$ LANGUAGE plpgsql;
-
-CREATE TRIGGER tr_update_titulares_en_marca
-AFTER INSERT OR UPDATE OR DELETE ON actas_titulares
-FOR EACH ROW EXECUTE FUNCTION func_actualizar_titulares_marca();
