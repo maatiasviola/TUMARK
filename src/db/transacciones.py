@@ -4,6 +4,7 @@ import json
 from src.db.conexion import get_pg_conn
 from psycopg2.extras import execute_values
 from src.db.conexion import get_pg_conn, get_supabase
+import re
 
 # El "cerebro" de la memoria rápida
 cache_dimensiones = {
@@ -31,27 +32,44 @@ def inicializar_cache_desde_db():
     finally:
         conn.close()
 
-def obtener_id_dimension(tabla, col_desc, valor_raw):
+def obtener_id_dimension(tabla, col_desc, valor_raw, nro_acta=None):
     """Busca en memoria y si no existe, inserta en DB y actualiza memoria."""
-    # Lógica de "EN TRAMITE"
-    if not valor_raw or valor_raw.strip() == "":
-        valor = "EN TRAMITE"
+    
+    # 1. Limpieza EXTREMA de caracteres invisibles y HTML
+    if not valor_raw:
+        valor_limpio = ""
     else:
-        valor = valor_raw.strip().replace("[", "").replace("]", "").upper()
+        valor_limpio = re.sub(r'\s+', ' ', str(valor_raw)).replace("[", "").replace("]", "").strip().upper()
 
-    # 1. Check memoria
-    if valor in cache_dimensiones[tabla]:
-        return cache_dimensiones[tabla][valor]
+    # 2. Manejo inteligente de NULOS y trazabilidad
+    if valor_limpio == "":
+        if tabla == "dim_estado_tramite_acta":
+            valor_limpio = "EN TRAMITE"
+            # LOG DE ANOMALÍA:
+            if nro_acta:
+                print(f"   ⚠️ [Acta {nro_acta}] Estado de trámite vacío. Forzando a 'EN TRAMITE'.")
+        else:
+            # LOG DE ANOMALÍA:
+            # if nro_acta:
+            #    print(f"   ⚠️ [Acta {nro_acta}] Dato vacío para {tabla}. Guardando como NULL.")
+            return None 
 
-    # 2. Fallback: Insertar en DB si es nuevo
-    print(f"✨ Valor nuevo en {tabla}: {valor}. Registrando en DB...")
+    # 3. Check memoria
+    if valor_limpio in cache_dimensiones[tabla]:
+        return cache_dimensiones[tabla][valor_limpio]
+
+    # 4. Fallback: Insertar en DB si es 100% nuevo (y avisar de qué acta vino)
+    acta_info = f" (Origen: Acta {nro_acta})" if nro_acta else ""
+    print(f"✨ Valor nuevo en {tabla}: '{valor_limpio}'{acta_info}. Registrando en DB...")
+    
     sb = get_supabase()
-    res = sb.table(tabla).upsert({col_desc: valor}, on_conflict=col_desc).execute()
+    res = sb.table(tabla).upsert({col_desc: valor_limpio}, on_conflict=col_desc).execute()
     
     if res.data:
         new_id = list(res.data[0].values())[0]
-        cache_dimensiones[tabla][valor] = new_id
+        cache_dimensiones[tabla][valor_limpio] = new_id
         return new_id
+        
     return None
 
 def guardar_lote_tramites_completo(lista_datos_raw):
@@ -91,8 +109,8 @@ def guardar_lote_tramites_completo(lista_datos_raw):
                 ids_titulares_sorted = sorted(list(set(ids_titulares_acta)))
 
                 # Dimensiones desde caché en memoria — cero peticiones a la DB
-                id_tipo   = obtener_id_dimension("dim_tipo_marca", "tipo_marca", datos.get('tipo_marca_texto'))
-                id_estado = obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos.get('estado_tramite'))
+                id_tipo   = obtener_id_dimension("dim_tipo_marca", "tipo_marca", datos.get('tipo_marca_texto'), datos['nro_acta'])
+                id_estado = obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos.get('estado_tramite'), datos['nro_acta'])
                 id_img    = datos.get('id_imagen')
                 hash_img  = datos.get('hash_imagen') # <-- Leemos el hash que mandó el worker
 
@@ -137,9 +155,16 @@ def guardar_lote_tramites_completo(lista_datos_raw):
                 nro_res = int(datos['nro_resolucion']) \
                           if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit() \
                           else None
+                
+                id_clase_raw = datos.get('id_clase')
+                if not id_clase_raw or id_clase_raw == 0:
+                    print(f"   ⚠️ [Acta {datos['nro_acta']}] Sin clase o clase 0. Guardando como NULL.")
+                    id_clase_final = None
+                else:
+                    id_clase_final = id_clase_raw
 
                 actas_para_insertar.append((
-                    datos['nro_acta'], id_m, datos.get('id_clase'), datos['_id_estado'],
+                    datos['nro_acta'], id_m, id_clase_final, datos['_id_estado'],
                     datos.get('id_imagen'), datos['_id_tipo'], datos.get('denominacion'),
                     datos.get('fecha_ingreso'), datos.get('fecha_vencimiento'),
                     nro_res, datos.get('fecha_disposicion'), datos.get('es_clase_completa')
@@ -220,7 +245,7 @@ def guardar_lote_tramites_completo(lista_datos_raw):
                 if not id_a_interno:
                     continue
                 for v in datos.get('vistas', []):
-                    id_tv = obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'))
+                    id_tv = obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'), datos['nro_acta'])
                     id_opo_vinculada = map_acta_nro_opo_idopo.get(
                         (id_a_interno, v.get('nro_oposicion_vinculada'))
                     )
@@ -241,13 +266,6 @@ def guardar_lote_tramites_completo(lista_datos_raw):
                     ) VALUES %s;
                 """, vistas_para_insertar)
 
-            conn.commit()
-            print(
-                f"🚀 LOTE: {len(actas_para_insertar)} actas · "
-                f"{len(oposiciones_para_insertar)} oposiciones · "
-                f"{len(vistas_para_insertar)} vistas"
-            )
-
         # ─────────────────────────────────────────────────────────────────
         # FASE 7 — Productos (fuera de la transacción, usa Supabase HTTP)
         # FIX: itera lista_datos_procesados
@@ -261,6 +279,13 @@ def guardar_lote_tramites_completo(lista_datos_raw):
                     datos.get('proteccion', ''),
                     datos.get('limitacion', '')
                 )
+
+            conn.commit()
+            print(
+                f"🚀 LOTE: {len(actas_para_insertar)} actas · "
+                f"{len(oposiciones_para_insertar)} oposiciones · "
+                f"{len(vistas_para_insertar)} vistas"
+            )
 
         return True
 
@@ -360,8 +385,13 @@ def _fetch_all_subitems_clase(sb, id_clase):
         
     return all_ids
 
-def procesar_productos(id_acta_interno, id_clase, proteccion_raw, limitacion_raw):
-    sb = get_supabase()
+def procesar_productos(cur, id_acta_interno, id_clase, proteccion_raw, limitacion_raw):
+    """
+    Versión SQL pura y ultra-rápida. Cero peticiones HTTP.
+    """
+    if not id_clase or id_clase == 0:
+        return
+
     proteccion = proteccion_raw.upper().strip() if proteccion_raw else ""
     limitacion = limitacion_raw.upper().strip() if limitacion_raw else ""
     
@@ -373,31 +403,21 @@ def procesar_productos(id_acta_interno, id_clase, proteccion_raw, limitacion_raw
     elif "EXCEPTO" in proteccion: modo = "EXCEPTO" 
 
     if modo in ["TODA_LA_CLASE", "EXCEPTO"]:
-        ids_a_vincular = _fetch_all_subitems_clase(sb, id_clase)
-        texto_analizar = limitacion if modo == "TODA_LA_CLASE" else proteccion
+        cur.execute("SELECT id_subitem FROM dim_subitems_clases_niza WHERE id_clase = %s", (id_clase,))
+        ids_a_vincular = {row[0] for row in cur.fetchall()}
         
-        if "EXCEPTO" in texto_analizar:
-            partes = texto_analizar.split("EXCEPTO")
-            texto_exclusiones = partes[-1]
-        elif modo == "TODA_LA_CLASE" and limitacion:
-            texto_exclusiones = limitacion
-        else:
-            texto_exclusiones = ""
-
+        texto_analizar = limitacion if modo == "TODA_LA_CLASE" else proteccion
+        texto_exclusiones = texto_analizar.split("EXCEPTO")[-1] if "EXCEPTO" in texto_analizar else (limitacion if modo == "TODA_LA_CLASE" else "")
+        
         items_excluir = [x.strip().strip(".;") for x in texto_exclusiones.split(';') if x.strip()]
         
         if items_excluir:
-            ids_a_restar = set()
-            for item in items_excluir:
-                try:
-                    res = sb.table("dim_subitems_clases_niza")\
-                            .select("id_subitem")\
-                            .eq("id_clase", id_clase)\
-                            .ilike("subitem", item)\
-                            .execute()
-                    if res.data:
-                        for row in res.data: ids_a_restar.add(row['id_subitem'])
-                except: pass
+            # Magia de Postgres: ILIKE ANY compara contra una lista completa en 1 paso
+            cur.execute("""
+                SELECT id_subitem FROM dim_subitems_clases_niza 
+                WHERE id_clase = %s AND subitem ILIKE ANY(%s)
+            """, (id_clase, items_excluir))
+            ids_a_restar = {row[0] for row in cur.fetchall()}
             ids_a_vincular = ids_a_vincular - ids_a_restar
 
     else:
@@ -407,36 +427,35 @@ def procesar_productos(id_acta_interno, id_clase, proteccion_raw, limitacion_raw
         
         items_texto = [x.strip().strip(".;") for x in texto_full.split(';') if x.strip()]
         
-        for item_desc in items_texto:
-            encontrado = False
-            try:
-                res = sb.table("dim_subitems_clases_niza")\
-                          .select("id_subitem")\
-                          .eq("id_clase", id_clase)\
-                          .ilike("subitem", item_desc)\
-                          .execute()
-                if res.data:
-                    encontrado = True
-                    for row in res.data: ids_a_vincular.add(row['id_subitem'])
-            except: pass
+        if items_texto:
+            cur.execute("""
+                SELECT id_subitem, subitem FROM dim_subitems_clases_niza 
+                WHERE id_clase = %s AND subitem ILIKE ANY(%s)
+            """, (id_clase, items_texto))
             
-            if not encontrado:
-                items_desnormalizados.append(item_desc)
+            encontrados = cur.fetchall()
+            ids_a_vincular = {row[0] for row in encontrados}
+            
+            nombres_encontrados = {row[1].upper() for row in encontrados}
+            for item_desc in items_texto:
+                if item_desc.upper() not in nombres_encontrados:
+                    items_desnormalizados.append(item_desc)
 
+    # Inserción masiva de Subitems Vinculados
     if ids_a_vincular:
-        links = [{"id_acta": id_acta_interno, "id_subitem": i} for i in ids_a_vincular]
-        try:
-            for i in range(0, len(links), 500):
-                sb.table("actas_subitems").upsert(links[i:i+500], on_conflict="id_acta,id_subitem").execute()
-        except Exception as e: print(f"     ⚠️ Error guardando vínculos: {e}")
+        links = [(id_acta_interno, i) for i in ids_a_vincular]
+        execute_values(cur, """
+            INSERT INTO actas_subitems (id_acta, id_subitem) VALUES %s
+            ON CONFLICT (id_acta, id_subitem) DO NOTHING;
+        """, links)
 
+    # Inserción masiva de Desnormalizados
     if items_desnormalizados:
         items_unicos = list(set(items_desnormalizados))
-        desnorm_data = [{"id_acta": id_acta_interno, "subitem_desnormalizado": txt} for txt in items_unicos]
-        try:
-            for i in range(0, len(desnorm_data), 500):
-                sb.table("actas_subitems_desnormalizados").insert(desnorm_data[i:i+500]).execute()
-        except Exception as e: print(f"     ⚠️ Error guardando desnormalizados: {e}")
+        desnorm_data = [(id_acta_interno, txt) for txt in items_unicos]
+        execute_values(cur, """
+            INSERT INTO actas_subitems_desnormalizados (id_acta, subitem_desnormalizado) VALUES %s;
+        """, desnorm_data)
 
 
 # --- 2. FUNCIÓN PRINCIPAL ---

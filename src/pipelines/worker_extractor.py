@@ -80,7 +80,9 @@ async def worker_sqs():
     ssl_ctx = crear_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=CONCURRENCIA_MAXIMA)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    #async with aiohttp.ClientSession(connector=connector) as session:
+    headers = {"Accept-Encoding": "gzip, deflate"}
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         while True:
             response = await asyncio.to_thread(
                 sqs.receive_message,
