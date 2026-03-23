@@ -16,7 +16,7 @@ FASES = {
     "fase2": {
         "chunks": [("2024-01-01", "2024-01-31")],
         "n_workers": 1,
-        "env": {"CONCURRENCIA": "10", "DELAY_MIN": "0.5", "DELAY_MAX": "1.5"},
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "0.5", "DELAY_MAX": "1.5"},
     },
     "fase3": {
         "chunks": [
