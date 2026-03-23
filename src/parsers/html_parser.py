@@ -5,6 +5,10 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from src.clientes.inpi_marcas import obtener_texto_vista
 
+# ──────────────────────────────────────────────────────────────────────────
+# 1. UTILIDADES DE FECHAS (Intactas)
+# ──────────────────────────────────────────────────────────────────────────
+
 def limpiar_fecha_ms(date_str):
     if not date_str or not isinstance(date_str, str) or "/Date(" not in date_str: return date_str
     match = re.search(r'(-?\d+)', date_str)
@@ -55,6 +59,57 @@ def limpiar_lista_tramites(lista):
                 item[key] = normalizar_fecha_str(value)
     return lista
 
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2. MOTOR DE EXTRACCIÓN SEGURO (NUEVO)
+# ──────────────────────────────────────────────────────────────────────────
+
+def extraer_valor_seguro(soup, etiqueta):
+    """
+    Busca estrictamente en el texto del label (ignorando los valores).
+    Rendimiento optimizado para un solo recorrido. Reemplaza a extraer_valor_flexible.
+    """
+    clave = etiqueta.replace(":", "").strip().upper()
+    
+    for label in soup.find_all('label'):
+        # 1. Extraemos SOLO el texto directo del label (sin los hijos)
+        textos_directos = [t for t in label.find_all(string=True, recursive=False)]
+        texto_label_limpio = " ".join(textos_directos).replace('\xa0', ' ').strip().upper()
+        
+        # 2. Match estricto
+        if texto_label_limpio.startswith(clave) or f"{clave}:" in texto_label_limpio:
+            span = label.find('span')
+            if span:
+                valor = span.get_text().strip()
+                return valor if valor and valor != "----" else None
+            
+            # Plan B: Sin <span>. Cortamos SOLO en el primer ":"
+            texto_completo = label.get_text().replace('\xa0', ' ').strip()
+            partes = texto_completo.split(":", 1) 
+            if len(partes) > 1:
+                valor = partes[1].strip()
+                return valor if valor and valor != "----" else None
+                
+    return None
+
+def extraer_valor_flexible_elemento(elemento_label):
+    """
+    Se mantiene para extraer_titulares_multiples que pasa el objeto label directo.
+    """
+    if not elemento_label: return ""
+    span = elemento_label.find('span', class_='text-danger')
+    if span: 
+        return span.get_text(strip=True)
+    texto_completo = elemento_label.get_text(" ", strip=True)
+    if ":" in texto_completo:
+        return texto_completo.split(":", 1)[1].strip()
+    return texto_completo.strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3. EXTRACCIONES ESPECÍFICAS (Intactas)
+# ──────────────────────────────────────────────────────────────────────────
+
 def extraer_disposicion(soup):
     span_label = soup.find('span', string=re.compile(r"Fecha:", re.I))
     if span_label:
@@ -62,75 +117,35 @@ def extraer_disposicion(soup):
         if valor: return valor.get_text(strip=True)
     return ""
 
-def extraer_valor_flexible(soup, label_text):
-    """Busca el valor de un label, priorizando texto en rojo si existe."""
-    elemento = soup.find(string=re.compile(rf"{label_text}", re.I))
-    if not elemento: return ""
-    parent = elemento.find_parent()
-    span = parent.find('span', class_='text-danger')
-    if span: return span.get_text(strip=True)
-    texto_limpio = parent.get_text(" ", strip=True)
-    return texto_limpio.split(":", 1)[1].strip() if ":" in texto_limpio else ""
-
 def extraer_estado_tramite(soup):
     candidatos = soup.find_all(string=re.compile(r"TIPO", re.I))
     fallback = None
-
     for c in candidatos:
         texto = c.strip().upper()
-        # Buscamos exactamente la etiqueta "TIPO:" o "TIPO :"
         if not re.match(r"^TIPO\s*:$", texto):
             continue
-            
         parent = c.find_parent()
         if not parent: continue
-
         span_rojo = parent.find('span', class_='text-danger')
         if span_rojo:
             valor = span_rojo.get_text(strip=True)
             if valor: return valor
-        
         if fallback is None:
             texto_completo = parent.get_text(" ", strip=True)
             if ":" in texto_completo:
                 val = texto_completo.split(":", 1)[1].strip()
                 if val: fallback = val
-
     return fallback
 
-def extraer_pais(soup):
-    """Busca el campo PAIS en el detalle. Por defecto ARGENTINA."""
-    candidatos = soup.find_all(string=re.compile(r"PAIS\s*:", re.I))
-    for c in candidatos:
-        texto = c.strip()
-        if ":" in texto:
-            valor = texto.split(":", 1)[1].strip().upper()
-            if valor: return valor
-    return "ARGENTINA"
-
 def extraer_fecha_vencimiento_marca(soup):
-    """
-    Busca la fecha de vencimiento localizando el texto 'VENCE:' directamente.
-    Es agnóstico de la sección (no usa collapse-nine) pero preciso con la etiqueta.
-    """
-    # 1. Buscamos el nodo de texto que contenga "VENCE:" (ignorando mayúsculas/minúsculas)
-    # Usamos re.compile para que encuentre "VENCE:" incluso si tiene espacios alrededor.
     nodo_texto = soup.find(string=re.compile(r"^\s*VENCE\s*:", re.I))
-    
     if nodo_texto:
-        # 2. Subimos al elemento padre (el <label>)
         padre = nodo_texto.find_parent('label', class_='input')
-        
         if padre:
-            # 3. Buscamos el span con la clase 'text-danger' dentro de ese label
             span_valor = padre.find('span', class_='text-danger')
-            
             if span_valor:
-                # Obtenemos el texto (ej: "29/07/2035 0:00:00")
                 fecha_raw = span_valor.get_text(strip=True)
-                # Cortamos para quedarnos solo con la fecha (sacamos la hora si existe)
                 return fecha_raw.split(' ')[0]
-                
     return None
 
 def extraer_datos_js(html_text, variable_name):
@@ -144,70 +159,34 @@ def extraer_datos_js(html_text, variable_name):
         except: return []
     return []
 
-def extraer_valor_flexible_elemento(elemento_label):
-    """
-    Extrae el valor de un label específico (objeto BeautifulSoup), 
-    priorizando el span text-danger.
-    """
-    if not elemento_label: return ""
-    
-    # 1. Intentar buscar span danger dentro
-    span = elemento_label.find('span', class_='text-danger')
-    if span: 
-        return span.get_text(strip=True)
-    
-    # 2. Si no tiene span, sacar el texto del label y limpiar el título (ej: "PAIS: ARGENTINA")
-    texto_completo = elemento_label.get_text(" ", strip=True)
-    if ":" in texto_completo:
-        return texto_completo.split(":", 1)[1].strip()
-    
-    return texto_completo.strip()
-
 def extraer_titulares_multiples(soup):
-    """
-    Busca dentro del panel de Titularidad (collapse-two) todos los titulares.
-    Soporta múltiples dueños y extrae porcentaje del nombre.
-    """
     titulares = []
-    
-    # 1. Buscar el contenedor de Titularidad para no mezclar con otros paneles
     panel_titularidad = soup.find('div', id='collapse-two')
     if not panel_titularidad:
         return []
 
-    # 2. Buscar todas las etiquetas que empiezan con "NOMBRE:"
-    # Usamos find_all para iterar sobre cada dueño
     labels_nombres = panel_titularidad.find_all(string=re.compile(r"NOMBRE\s*:", re.I))
 
     for nodo_texto_nombre in labels_nombres:
         label_nombre = nodo_texto_nombre.find_parent('label')
         if not label_nombre: continue
 
-        # --- A. NOMBRE Y PORCENTAJE ---
         valor_nombre_full = extraer_valor_flexible_elemento(label_nombre)
-        
         nombre = valor_nombre_full
         porcentaje = 100.0
         
-        # Buscamos patrón de porcentaje al final (Ej: "JUAN PEREZ 50.00%")
         match_porc = re.search(r'(\d{1,3}(?:[.,]\d{1,2})?)\s*%', valor_nombre_full)
         if match_porc:
-            str_porc = match_porc.group(1).replace(',', '.') # Normalizar decimal
+            str_porc = match_porc.group(1).replace(',', '.') 
             try:
                 porcentaje = float(str_porc)
-                # Quitamos el porcentaje del nombre
                 nombre = valor_nombre_full.replace(match_porc.group(0), '').strip()
             except: pass
 
-        # --- B. CUIT Y PAIS (Buscamos los próximos relativos al nombre actual) ---
-        
-        # CUIT: Buscamos el siguiente label que diga CUIT
         label_cuit = label_nombre.find_next('label', string=re.compile(r"CUIT\s*:", re.I))
         val_cuit = extraer_valor_flexible_elemento(label_cuit)
-        # Limpiar guiones y dejar solo números
         cuit_limpio = "".join(filter(str.isdigit, val_cuit))
 
-        # PAIS: Buscamos el siguiente label que diga PAIS
         label_pais = label_nombre.find_next('label', string=re.compile(r"PAIS\s*:", re.I))
         val_pais = extraer_valor_flexible_elemento(label_pais)
 
@@ -221,41 +200,33 @@ def extraer_titulares_multiples(soup):
     return titulares
 
 def extraer_nro_oposicion_profundo(html_contenido, nro_acta_filtro=None):
-    """
-    Busca el número de oposición en el texto de la vista.
-    nro_acta_filtro: (int/str) Si se encuentra este número, se ignora (evita confundir Acta con Oposición).
-    """
     if not html_contenido: return None
-    
-    # Limpieza básica
     texto_plano = re.sub(r'<[^>]+>', ' ', html_contenido).replace("&nbsp;", " ").replace("\xa0", " ")
-    
-    # NUEVA REGEX MÁS ESTRICTA:
-    # 1. Busca "Oposición" o "Oposiciones"
-    # 2. Permite texto intermedio corto (deducida por..., bajo el nro..., etc) pero NO cualquier cosa
-    # 3. Busca el número
-    # (?: ... ) es un grupo sin captura.
-    # \s* permite espacios.
     patron = r"Oposici[oó]n(?:es)?(?:\s+deducida)?\s*(?:bajo el|N[°º]|Nro\.?|Numero)?\s*:?\s*(\d{6,8})"
-    
     matches = re.findall(patron, texto_plano, re.IGNORECASE)
     
     for m in matches:
         try:
             val = int(m)
-            # FILTRO DE SEGURIDAD: Si el número encontrado es igual al Acta, es un falso positivo.
             if nro_acta_filtro and val == int(nro_acta_filtro):
                 continue
             return val
         except:
             continue
-            
     return None
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# 4. FUNCIÓN PRINCIPAL (Refactorizada con Pre-asignación y Logs)
+# ──────────────────────────────────────────────────────────────────────────
+
 def parsear_detalle_html(html, nro_acta):
+    if not html:
+        return None
+
     soup = BeautifulSoup(html, 'html.parser')
 
+    # Extracción de Imagen
     img_tag = soup.find(id="logo")
     url_img = None
     if img_tag:
@@ -264,22 +235,36 @@ def parsear_detalle_html(html, nro_acta):
             if src.startswith("http") or src.startswith("data:"):
                 url_img = src
             else:
-                # Si es relativa, le pegamos el dominio del INPI
                 base = "https://portaltramites.inpi.gob.ar"
                 url_img = base + (src if src.startswith("/") else "/" + src)
 
+    # ── Pre-asignación con el Motor Seguro (Cero falsos positivos) ──
+    denominacion_raw = extraer_valor_seguro(soup, "DENOMINACIÓN:")
+    tipo_marca_raw   = extraer_valor_seguro(soup, "TIPO DE MARCA:")
+    clase_raw        = extraer_valor_seguro(soup, "CLASE:")
+    presentacion_raw = extraer_valor_seguro(soup, "PRESENTACIÓN:")
+    proteccion_raw   = extraer_valor_seguro(soup, "PROTECCION:")
+    limitacion_raw   = extraer_valor_seguro(soup, "LIMITACION:")
+    nro_res_raw      = extraer_valor_seguro(soup, "NRO:")
 
+    # ── Salvavidas de Logs (Auditoría estructural) ──
+    if clase_raw is None:
+        print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontró CLASE. Se guardará como NULL.")
+    if denominacion_raw is None:
+        print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontró DENOMINACIÓN.")
+
+    # ── Armado del Diccionario ──
     datos = {
         "nro_acta": int(nro_acta),
-        "denominacion": extraer_valor_flexible(soup, "DENOMINACIÓN:").upper(),
-        "tipo_marca_texto": extraer_valor_flexible(soup, "TIPO DE MARCA:"),
-        "id_clase": int(extraer_valor_flexible(soup, "CLASE:") or 0),
-        "fecha_ingreso": normalizar_fecha_str(extraer_valor_flexible(soup, "PRESENTACIÓN:").split(' ')[0]),
+        "denominacion": denominacion_raw.upper() if denominacion_raw else "",
+        "tipo_marca_texto": tipo_marca_raw,
+        "id_clase": int(clase_raw) if clase_raw and clase_raw.strip().isdigit() else None,
+        "fecha_ingreso": normalizar_fecha_str(presentacion_raw.split(' ')[0]) if presentacion_raw else None,
         "fecha_vencimiento": normalizar_fecha_str(extraer_fecha_vencimiento_marca(soup)),
-        "proteccion": extraer_valor_flexible(soup, "PROTECCION:"),
-        "limitacion": extraer_valor_flexible(soup, "LIMITACION:"),
+        "proteccion": proteccion_raw,
+        "limitacion": limitacion_raw,
         "url_imagen": url_img, 
-        "nro_resolucion": extraer_valor_flexible(soup, "NRO:"),
+        "nro_resolucion": nro_res_raw,
         "estado_tramite": extraer_estado_tramite(soup),
         "fecha_disposicion": normalizar_fecha_str(extraer_disposicion(soup))
     }
@@ -288,10 +273,12 @@ def parsear_detalle_html(html, nro_acta):
     texto_proteccion = datos.get('proteccion', '') or ""
     datos['es_clase_completa'] = texto_proteccion.strip().upper() == "TODA LA CLASE"
 
-    # Titulares
+    # Titulares (con log si fallan)
     datos["titulares"] = extraer_titulares_multiples(soup)
+    if not datos["titulares"]:
+        print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontraron TITULARES.")
 
-    # Vistas 
+    # ── Vistas y JavaScript (Intacto) ──
     vistas_raw = extraer_datos_js(html, "vistas")
     vistas_finales = []
     for v in vistas_raw:
@@ -299,9 +286,9 @@ def parsear_detalle_html(html, nro_acta):
         nro_vinculado = None
         if id_vista:
             html_texto = obtener_texto_vista(id_vista)
-            # AQUI ESTA EL CAMBIO: Pasamos el filtro
             nro_vinculado = extraer_nro_oposicion_profundo(html_texto, nro_acta_filtro=nro_acta)
             time.sleep(0.7)
+            
         v_limpio = {}
         for k, val in v.items():
             if isinstance(val, str):
@@ -309,11 +296,12 @@ def parsear_detalle_html(html, nro_acta):
             else:
                 v_limpio[k] = val
         v_limpio["nro_oposicion_vinculada"] = nro_vinculado
+        v_limpio["Tipo"] = v.get("Tipo", "").strip() if v.get("Tipo") else None # FIX de seguridad por si no viene Tipo
         vistas_finales.append(v_limpio)
 
     datos["vistas"] = vistas_finales
 
-    # Otros trámites
+    # ── Otros trámites JS (Intacto) ──
     datos["oposiciones"] = limpiar_lista_tramites(extraer_datos_js(html, "opos"))
     datos["transferencias"] = limpiar_lista_tramites(extraer_datos_js(html, "transferencias"))
     datos["renuncias"] = limpiar_lista_tramites(extraer_datos_js(html, "Renuncias"))
