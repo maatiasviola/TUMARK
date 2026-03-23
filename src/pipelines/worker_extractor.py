@@ -125,7 +125,7 @@ async def worker_sqs():
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=150))
 
-    sem             = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
+    sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
     cola_resultados = asyncio.Queue(maxsize=100)
 
     # Set para mantener referencias a tasks vivas y evitar que el GC las destruya.

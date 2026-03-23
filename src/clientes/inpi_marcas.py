@@ -31,7 +31,6 @@ async def obtener_lista_actas(session, payload):
 
 async def obtener_html_detalle(session, nro_acta, proxy=None):
     t0 = time.time()
-    """[ASYNC] Obtiene el HTML del detalle de una marca."""
     payload = {"acta": nro_acta}
     try:
         async with session.post(
@@ -45,10 +44,17 @@ async def obtener_html_detalle(session, nro_acta, proxy=None):
                 html = await response.text()
                 metricas.registrar_html(html, time.time() - t0, response.status)
                 return html
-    except Exception:
-        metricas.registrar_error(reintento=False)
-        return None
-    return None
+            elif response.status in (403, 429):
+                # 403 = Baneo de IP / WAF | 429 = Límite de velocidad superado
+                print(f"🧱 [HTTP {response.status}] FIREWALL INPI: Bloqueo detectado para acta {nro_acta}.")
+                response.raise_for_status() # Forzamos la excepción para que el worker reintente
+            else:
+                print(f"⚠️ [HTTP {response.status}] Error del servidor INPI para acta {nro_acta}.")
+                response.raise_for_status()
+                
+    except Exception as e:
+        # Ya no tapamos el error, dejamos que suba al worker
+        raise e
 
 # --- MÉTODOS SINCRÓNICOS (Para compatibilidad con servicio_tramite) ---
 
