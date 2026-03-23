@@ -56,7 +56,7 @@ async def extraer_y_encolar(session, nro_acta, receipt_handle, sem, cola_resulta
             
             # 3. Procesamiento y Storage de imagen (afuera del semáforo)
             if html:
-                datos = html_parser.parsear_detalle_html(html, nro_acta)
+                datos = await asyncio.to_thread(html_parser.parsear_detalle_html, html, nro_acta)
                 if datos:
                     if datos.get("url_imagen"):
                         id_img, hash_img = await asyncio.wait_for(
