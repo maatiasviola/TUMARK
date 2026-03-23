@@ -291,7 +291,6 @@ def parsear_detalle_html(html, nro_acta):
         if id_vista:
             html_texto = obtener_texto_vista(id_vista)
             nro_vinculado = extraer_nro_oposicion_profundo(html_texto, nro_acta_filtro=nro_acta)
-            time.sleep(0.7)
             
         v_limpio = {}
         for k, val in v.items():

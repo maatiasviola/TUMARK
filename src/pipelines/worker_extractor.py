@@ -87,7 +87,7 @@ async def extraer_y_encolar(session, nro_acta, receipt_handle, sem, cola_resulta
 
 async def worker_sqs():
     loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=50))
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=150))
 
     sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
     cola_resultados = asyncio.Queue(maxsize=100) # <-- LA NUEVA COLA INTERNA
@@ -131,7 +131,7 @@ async def worker_sqs():
                 for res in resultados_gather:
                     if isinstance(res, Exception):
                         print(f"🔥 ERROR FATAL EN WORKER (Atrapado a tiempo): {repr(res)}")
-                        
+
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         # ─── MOTOR 2: EL CONSUMIDOR (Habla con PostgreSQL y SQS) ────
@@ -158,8 +158,12 @@ async def worker_sqs():
                 # Guardamos si juntamos 10 actas, o si pasaron 5 segundos
                 if len(lote) >= MAX_LOTE or (lote and tiempo_desde_flush >= MAX_ESPERA):
                     t_db = time.time()
-                    exito_db = await asyncio.to_thread(transacciones.guardar_lote_tramites_completo, lote)
-                    metricas.registrar_lote_db(len(lote), time.time() - t_db)
+                    try:
+                        exito_db = await asyncio.to_thread(transacciones.guardar_lote_tramites_completo, lote)
+                        metricas.registrar_lote_db(len(lote), time.time() - t_db)
+                    except Exception as e:
+                        print(f"🚨 ERROR CRÍTICO EN DB: {e}")
+                        exito_db = False # Forzamos que no se borren de SQS
 
                     if exito_db:
                         entries = [{'Id': str(i), 'ReceiptHandle': h} for i, h in enumerate(handles)]
