@@ -14,7 +14,7 @@ ON CONFLICT (id_estado_tramite) DO NOTHING;
 
 -- 3. TIPOS DE VISTA
 INSERT INTO dim_tipos_vistas (id_tipo_vista, tipo_vista) VALUES
-(1, 'ADMINISTRATIVAS'), (2, 'OPOSICIONES')
+(1, 'ADMINISTRATIVAS'), (2, 'OPOSICIONES'),(3, 'TRANSFERENCIAS')
 ON CONFLICT (id_tipo_vista) DO NOTHING;
 
 -- Sincronizar secuencias para que los inserts automáticos sigan desde el último ID

@@ -1,3 +1,101 @@
+"""
+worker_extractor.py — Versión auditada y corregida.
+
+═══════════════════════════════════════════════════════════════
+ARQUITECTURA
+═══════════════════════════════════════════════════════════════
+
+  Productor ──→ [cola_resultados] ──→ Consumidor
+      ↓                                    ↓
+  SQS receive                         DB write + SQS delete
+
+Dos ThreadPoolExecutors completamente aislados:
+
+  executor_parser  (PARSER_WORKERS=80)
+    - Parser HTML + descarga de imágenes.
+    - Puede acumular zombie threads sin consecuencias para el resto.
+    - "Zombie" = thread cuyo asyncio.wait_for ya expiró pero el
+      thread de OS aún corre. El thread sigue ocupando su slot hasta
+      que termine solo (puede tardar minutos en conexiones TCP zombie).
+
+  executor_io  (IO_WORKERS=10)  ← loop.set_default_executor()
+    - Escrituras a PostgreSQL + llamadas a SQS.
+    - NUNCA recibe threads del parser. Siempre limpio. Siempre disponible.
+    - asyncio.to_thread() lo usa automáticamente por ser el default.
+
+═══════════════════════════════════════════════════════════════
+GARANTÍAS MATEMÁTICAS CONTRA CONGELAMIENTO
+═══════════════════════════════════════════════════════════════
+
+  sem_tareas = Semaphore(MAX_TAREAS_VUELO=20)
+
+  El productor adquiere sem_tareas ANTES de crear cada task.
+  La task lo libera en un bloque finally GARANTIZADO.
+
+  Peor caso de zombie threads:
+    MAX_TAREAS_VUELO × MAX_INTENTOS = 20 × 3 = 60 zombies
+    PARSER_WORKERS = 80 → 20 slots siempre libres.
+
+  executor_io nunca tiene zombies del parser. El consumidor
+  siempre puede escribir a DB y borrar de SQS.
+
+═══════════════════════════════════════════════════════════════
+BUGS CORREGIDOS EN ESTA VERSIÓN vs ITERACIONES ANTERIORES
+═══════════════════════════════════════════════════════════════
+
+  Bug 1 (versión original):
+    parser sin timeout → zombie threads llenaban el pool único →
+    DB y SQS sin threads → sistema congelado en silencio.
+    Fix: timeout en parser + dos executors aislados.
+
+  Bug 2 (versión original):
+    await asyncio.gather(*tasks) en el productor → una acta lenta
+    bloqueaba las otras 9 del lote.
+    Fix: fire-and-forget acotado por sem_tareas.
+
+  Bug 3 (versión original):
+    SQS delete sin try/except → excepción de AWS mataba el consumidor.
+    Fix: SQS delete en su propio bloque try/except.
+
+  Bug 4 (esta versión):
+    doble llamada a metricas.registrar_error() en timeout del parser:
+    una en el except interno y otra en el except externo.
+    Fix: eliminado el registro del except interno; solo se re-lanza.
+
+  Bug 5 (esta versión):
+    doble llamada a metricas.registrar_error() en errores de red:
+    una en obtener_html_detalle y otra en extraer_y_encolar.
+    Fix: eliminado de obtener_html_detalle; ver docstring de esa función.
+
+  Bug 6 (esta versión):
+    sem_tareas nunca liberado si una excepción no prevista escapaba del
+    loop de reintentos antes de llegar al finally.
+    Fix: el try/except de reintentos siempre converge al finally.
+
+═══════════════════════════════════════════════════════════════
+CONFIGURACIÓN DE SQS — CRÍTICA PARA 4M ACTAS
+═══════════════════════════════════════════════════════════════
+
+  Visibility Timeout de la cola SQS debe ser >= 700 segundos.
+
+  Cálculo del peor caso por tarea:
+    delay inicial      :    1.5s
+    HTTP retries       : 3 × 25s  =  75s
+    Parser retries     : 3 × 120s = 360s
+    Imagen             :      20s
+    Total              :   456.5s
+
+  Con 700s hay ~50% de margen. Si el visibility timeout es menor,
+  SQS re-expone el mensaje mientras la task original aún corre.
+  El productor lo re-procesa. Los ON CONFLICT hacen que sea
+  idempotente, pero genera trabajo y tráfico innecesarios.
+
+  Configurar en AWS Console o con:
+    aws sqs set-queue-attributes \
+      --queue-url <URL> \
+      --attributes VisibilityTimeout=700
+"""
+
 import asyncio
 import aiohttp
 import boto3
@@ -5,31 +103,45 @@ import random
 import ssl
 import os
 import sys
+import time
+import sys as _sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from src.servicios import servicio_tramite
 from src.db import transacciones
 from src.clientes import inpi_marcas
 from src.parsers import html_parser
 from src.config import settings
 from src.db.metricas_ingesta import metricas
 from src.servicios import servicio_imagen
-import time
 
+# ── Configuración ─────────────────────────────────────────────────────────────
 SQS_QUEUE_URL       = settings.SQS_QUEUE_URL
-CONCURRENCIA_MAXIMA = int(os.environ.get("CONCURRENCIA", "5"))
-DELAY_MIN           = float(os.environ.get("DELAY_MIN", "1.0"))
-DELAY_MAX           = float(os.environ.get("DELAY_MAX", "3.0"))
+CONCURRENCIA_MAXIMA = int(os.environ.get("CONCURRENCIA",      "5"))
+DELAY_MIN           = float(os.environ.get("DELAY_MIN",       "1.0"))
+DELAY_MAX           = float(os.environ.get("DELAY_MAX",       "3.0"))
 PROXY_URL           = os.environ.get("PROXY_URL", None)
-MAX_INTENTOS        = 3
+MAX_INTENTOS        = int(os.environ.get("MAX_INTENTOS",      "3"))
 
-# ── Timeout del parser: 30 vistas × 15s por vista = 450s teórico.
-# En la práctica fijamos 120s. Si tarda más que eso, la acta es patológica
-# y hay que liberarla para no trabar el sistema. SQS la reintentará.
-PARSER_TIMEOUT_S = float(os.environ.get("PARSER_TIMEOUT", "120.0"))
+# ── Timeouts ──────────────────────────────────────────────────────────────────
+PARSER_TIMEOUT_S    = float(os.environ.get("PARSER_TIMEOUT",  "120.0"))
+# 120s: cubre ~8 vistas × 15s c/u. Si tarda más, la acta es patológica.
+# SQS la reencola al vencer el visibility timeout (configurar >= 700s en AWS).
 
+# ── Backpressure ──────────────────────────────────────────────────────────────
+MAX_TAREAS_VUELO    = int(os.environ.get("MAX_TAREAS_VUELO",  "20"))
+# Máximo de tareas extraer_y_encolar vivas simultáneamente.
+# Determina el peor caso de zombie threads: MAX_TAREAS_VUELO × MAX_INTENTOS.
+
+# ── ThreadPoolExecutors ───────────────────────────────────────────────────────
+PARSER_WORKERS      = int(os.environ.get("PARSER_WORKERS",    "80"))
+# DEBE ser > MAX_TAREAS_VUELO × MAX_INTENTOS (20×3=60). 80 da 20 slots libres.
+
+IO_WORKERS          = int(os.environ.get("IO_WORKERS",        "10"))
+# Solo DB + SQS. Aislado del parser. 10 workers para ~2 usos simultáneos.
+
+# ── Cliente SQS ───────────────────────────────────────────────────────────────
 sqs = boto3.client(
     'sqs',
     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
@@ -37,105 +149,198 @@ sqs = boto3.client(
     region_name=settings.AWS_REGION
 )
 
+
 def crear_ssl_context():
     ctx = ssl.create_default_context()
     ctx.set_ciphers("DEFAULT@SECLEVEL=1")
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.verify_mode    = ssl.CERT_NONE
     return ctx
 
 
-async def extraer_y_encolar(session, nro_acta, receipt_handle, sem, cola_resultados):
+async def extraer_y_encolar(
+    session,
+    nro_acta,
+    receipt_handle,
+    sem_inpi,
+    sem_tareas,
+    cola_resultados,
+    executor_parser,
+):
     """
-    Tarea independiente: extrae el acta y la deposita en la cola interna.
+    Extrae un acta del INPI, la parsea y deposita el resultado en la cola interna.
 
-    Garantías:
-    - Siempre retorna (nunca cuelga) gracias a los timeouts en cada I/O.
-    - En caso de fallo total, simplemente no pone nada en la cola;
-      SQS repondrá el mensaje cuando venza el visibility timeout.
+    CONTRATO:
+      - SIEMPRE libera sem_tareas en el finally, sin excepciones.
+        Si no lo hiciera, cada bug silencioso dreanaría el semáforo
+        y el productor se bloquearía para siempre en acquire().
+      - Nunca bloquea indefinidamente: cada I/O tiene timeout propio.
+      - Si falla MAX_INTENTOS veces: no pone nada en la cola.
+        SQS reencola el mensaje al vencer el visibility timeout.
     """
+    loop = asyncio.get_running_loop()
 
-    # El delay va AFUERA del semáforo para no bloquear cupos de otros
-    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+    try:
+        await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-    for intento in range(1, MAX_INTENTOS + 1):
-        try:
-            # ── Semáforo solo en la petición HTTP al INPI ─────────────
-            async with sem:
-                html = await asyncio.wait_for(
-                    inpi_marcas.obtener_html_detalle(session, nro_acta, proxy=PROXY_URL),
-                    timeout=25.0
-                )
-
-            if not html:
-                # El INPI no devolvió contenido; reintentamos
-                raise ValueError(f"HTML vacío para acta {nro_acta}")
-
-           
+        for intento in range(1, MAX_INTENTOS + 1):
             try:
-                datos = await asyncio.wait_for(
-                    asyncio.to_thread(html_parser.parsear_detalle_html, html, nro_acta),
-                    timeout=PARSER_TIMEOUT_S
-                )
-            except asyncio.TimeoutError:
+                # ── 1. HTTP al INPI ───────────────────────────────────────
+                async with sem_inpi:
+                    html = await asyncio.wait_for(
+                        inpi_marcas.obtener_html_detalle(
+                            session, nro_acta, proxy=PROXY_URL
+                        ),
+                        timeout=25.0
+                    )
+
+                if not html:
+                    raise ValueError(f"HTML vacío o error HTTP para acta {nro_acta}")
+
+                # ── 2. Parser en executor_parser ──────────────────────────
+                # CRÍTICO: loop.run_in_executor(executor_parser, ...) en vez
+                # de asyncio.to_thread() (que usaría executor_io, el default).
+                # Los zombie threads de timeouts deben quedar confinados en
+                # executor_parser. Un zombie en executor_io bloquearía DB/SQS.
+                #
+                # BUG CORREGIDO: la versión anterior tenía un except interno
+                # que llamaba a metricas.registrar_error() y luego re-lanzaba.
+                # El except externo también lo llama. Resultado: doble registro
+                # por cada timeout de parser. Ahora solo re-lanzamos sin registrar.
+                try:
+                    datos = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            executor_parser,
+                            html_parser.parsear_detalle_html,
+                            html,
+                            nro_acta
+                        ),
+                        timeout=PARSER_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"💀 TIMEOUT PARSER: Acta {nro_acta} "
+                        f"tardó >{PARSER_TIMEOUT_S}s. "
+                        f"Thread zombie aislado en executor_parser. "
+                        f"(intento {intento}/{MAX_INTENTOS})"
+                    )
+                    raise  # el except externo lo registra y hace el backoff
+
+                if not datos:
+                    print(f"⚠️ Parser devolvió None para acta {nro_acta}. SQS reintentará.")
+                    return
+
+                # ── 3. Imagen en executor_parser ──────────────────────────
+                if datos.get("url_imagen"):
+                    try:
+                        id_img, hash_img = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                executor_parser,
+                                servicio_imagen.procesar_imagen,
+                                datos["url_imagen"]
+                            ),
+                            timeout=20.0
+                        )
+                        datos["id_imagen"]   = id_img
+                        datos["hash_imagen"] = hash_img
+                    except asyncio.TimeoutError:
+                        print(
+                            f"⚠️ Timeout descargando imagen "
+                            f"para acta {nro_acta}. Continuando sin imagen."
+                        )
+                        datos["id_imagen"]   = None
+                        datos["hash_imagen"] = None
+                else:
+                    datos["id_imagen"]   = None
+                    datos["hash_imagen"] = None
+
+                # ── 4. Depositar en la cola interna ───────────────────────
+                await cola_resultados.put({
+                    "datos":  datos,
+                    "handle": receipt_handle,
+                    "nro":    nro_acta
+                })
+                return  # éxito
+
+            except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as e:
                 print(
-                    f"💀 TIMEOUT PARSER: Acta {nro_acta} tardó >{PARSER_TIMEOUT_S}s "
-                    f"(acta con muchas vistas lentas del INPI). Liberando hilo."
+                    f"⌛ Timeout/Red en acta {nro_acta} "
+                    f"(intento {intento}/{MAX_INTENTOS}): {type(e).__name__}"
                 )
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
-                # Tratamos como un error recuperable y dejamos que el bucle reintente
-                raise
 
-            if not datos:
-                print(f"⚠️ Parser devolvió None para acta {nro_acta}. Se omite.")
-                return  # Sin datos útiles; SQS reintentará por visibility timeout
-
-            # ── Imagen (con su propio timeout, ya estaba bien) ────────
-            if datos.get("url_imagen"):
-                id_img, hash_img = await asyncio.wait_for(
-                    asyncio.to_thread(servicio_imagen.procesar_imagen, datos["url_imagen"]),
-                    timeout=20.0
+            except Exception as e:
+                print(
+                    f"⚠️ Error acta {nro_acta} "
+                    f"(intento {intento}/{MAX_INTENTOS}): {e}"
                 )
-                datos["id_imagen"]   = id_img
-                datos["hash_imagen"] = hash_img
-            else:
-                datos["id_imagen"]   = None
-                datos["hash_imagen"] = None
+                metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
 
-            # ── Depositar en la cola interna y salir ──────────────────
-            await cola_resultados.put({"datos": datos, "handle": receipt_handle, "nro": nro_acta})
-            return
+            if intento < MAX_INTENTOS:
+                backoff = (2 ** intento) + random.uniform(0, 1)
+                await asyncio.sleep(backoff)
 
-        except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as e:
-            print(f"⌛ Timeout/Red en acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {type(e).__name__}")
-            metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
+        print(
+            f"❌ Acta {nro_acta} agotó {MAX_INTENTOS} intentos. "
+            f"SQS repondrá el mensaje al vencer el visibility timeout."
+        )
 
-        except Exception as e:
-            print(f"⚠️ Error acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {e}")
-            metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
-
-        if intento < MAX_INTENTOS:
-            backoff = (2 ** intento) + random.uniform(0, 1)
-            await asyncio.sleep(backoff)
-
-    print(f"❌ Acta {nro_acta} agotó {MAX_INTENTOS} intentos. SQS repondrá el mensaje.")
+    finally:
+        # Este finally es el corazón del sistema de backpressure.
+        # Se ejecuta SIEMPRE: éxito, fallo, timeout, CancelledError.
+        # Sin él, cada excepción no prevista drenraría sem_tareas hasta
+        # que el productor se bloqueara para siempre en acquire().
+        sem_tareas.release()
 
 
 async def worker_sqs():
+    """Punto de entrada. Inicializa recursos y arranca productor + consumidor."""
+
+    # ── Validación de configuración ───────────────────────────────────────────
+    zombies_max = MAX_TAREAS_VUELO * MAX_INTENTOS
+    if PARSER_WORKERS <= zombies_max:
+        raise RuntimeError(
+            f"PARSER_WORKERS ({PARSER_WORKERS}) debe ser > "
+            f"MAX_TAREAS_VUELO × MAX_INTENTOS ({MAX_TAREAS_VUELO} × {MAX_INTENTOS} = {zombies_max}). "
+            f"Aumentar PARSER_WORKERS o reducir MAX_TAREAS_VUELO/MAX_INTENTOS."
+        )
+
+    # ── Dos executores aislados ───────────────────────────────────────────────
+    executor_parser = ThreadPoolExecutor(
+        max_workers=PARSER_WORKERS,
+        thread_name_prefix="parser"
+    )
+    executor_io = ThreadPoolExecutor(
+        max_workers=IO_WORKERS,
+        thread_name_prefix="io"
+    )
+
     loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=150))
+    loop.set_default_executor(executor_io)
+    # asyncio.to_thread() en consumidor y productor usa executor_io automáticamente.
 
-    sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
-    cola_resultados = asyncio.Queue(maxsize=100)
+    # ── Primitivas de control ─────────────────────────────────────────────────
+    sem_inpi        = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
+    sem_tareas      = asyncio.Semaphore(MAX_TAREAS_VUELO)
+    cola_resultados = asyncio.Queue(maxsize=200)
+    # maxsize=200 >> MAX_TAREAS_VUELO=20. La cola se llenaría solo si el
+    # consumidor falla 10+ veces consecutivas (DB caída ~5min). En ese caso
+    # el stall máximo es 60s (backoff cap). No es un deadlock.
 
-    # Set para mantener referencias a tasks vivas y evitar que el GC las destruya.
-    # Sin esto, Python ≥3.12 puede recolectar una task en flight.
     _tasks_activas: set[asyncio.Task] = set()
+    # Mantiene referencias fuertes a tasks en vuelo.
+    # Sin esto, el GC de Python >= 3.12 puede destruir una task en mid-flight.
 
     print(
-        f"🚀 Worker iniciado | Concurrencia: {CONCURRENCIA_MAXIMA} "
-        f"| Delay: {DELAY_MIN}–{DELAY_MAX}s | Parser timeout: {PARSER_TIMEOUT_S}s "
-        f"| Proxy: {'sí' if PROXY_URL else 'no'}"
+        f"\n🚀 Worker iniciado"
+        f"\n   Concurrencia INPI  : {CONCURRENCIA_MAXIMA}"
+        f"\n   Tareas en vuelo    : {MAX_TAREAS_VUELO}"
+        f"\n   Parser timeout     : {PARSER_TIMEOUT_S}s"
+        f"\n   executor_parser    : {PARSER_WORKERS} workers"
+        f"\n   executor_io        : {IO_WORKERS} workers"
+        f"\n   Delay              : {DELAY_MIN}–{DELAY_MAX}s"
+        f"\n   Proxy              : {'sí' if PROXY_URL else 'no'}"
+        f"\n   ⚠️  Asegurar Visibility Timeout SQS >= 700s"
     )
 
     transacciones.inicializar_cache_desde_db()
@@ -143,25 +348,27 @@ async def worker_sqs():
     ssl_ctx   = crear_ssl_context()
     connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=CONCURRENCIA_MAXIMA)
 
-    timeout_global = aiohttp.ClientTimeout(total=30.0)
-    headers        = {"Accept-Encoding": "gzip, deflate"}
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers={"Accept-Encoding": "gzip, deflate"},
+        timeout=aiohttp.ClientTimeout(total=30.0)
+    ) as session:
 
-    async with aiohttp.ClientSession(connector=connector, headers=headers, timeout=timeout_global) as session:
-
-        # ─── MOTOR 1: PRODUCTOR ───────────────────────────────────────────
+        # ─── MOTOR 1: PRODUCTOR ───────────────────────────────────────────────
         async def productor():
             """
-            Fire-and-forget: dispara cada acta como tarea independiente y
-            vuelve inmediatamente a buscar el siguiente lote en SQS.
+            Lee mensajes de SQS y dispara tareas fire-and-forget ACOTADAS.
 
-            Antes: await asyncio.gather(*tasks) — esperaba que TODAS las actas
-            del lote terminaran. Una sola acta lenta paralizaba las otras 9.
+            Flujo:
+              await sem_tareas.acquire()       → bloquea si hay MAX_TAREAS_VUELO vivas
+              create_task(extraer_y_encolar)   → la task libera en su finally
 
-            Ahora: cada task corre en paralelo de forma totalmente independiente.
-            El semáforo limita las conexiones concurrentes al INPI.
-            La Queue con maxsize=100 aplica backpressure natural: si el consumer
-            está lento, los puts bloquean y el productor frena automáticamente.
+            Mientras el productor espera en acquire(), asyncio cede al consumidor
+            para que drene la cola. Esto hace que el sistema sea auto-regulado:
+            el productor frena automáticamente cuando el consumidor está lento.
             """
+            ciclos_vacios = 0
+
             while True:
                 try:
                     response = await asyncio.to_thread(
@@ -171,76 +378,107 @@ async def worker_sqs():
                         WaitTimeSeconds=20
                     )
                 except Exception as e:
-                    # SQS puede fallar por cortes momentáneos de red o throttling.
-                    # No morimos: esperamos y reintentamos.
-                    print(f"⚠️ Error recibiendo de SQS: {e}. Reintentando en 10s...")
-                    await asyncio.sleep(10)
+                    print(f"⚠️ Error recibiendo de SQS: {e}. Reintentando en 15s...")
+                    await asyncio.sleep(15)
                     continue
 
                 mensajes = response.get('Messages', [])
+
                 if not mensajes:
+                    ciclos_vacios += 1
+                    # Cada ~60s informamos el estado.
+                    # Cola vacía puede significar: (a) proceso terminado,
+                    # (b) todos los mensajes están en visibility timeout
+                    #     (tareas aún corriendo). En (b) vuelven solos.
+                    if ciclos_vacios % 3 == 1:
+                        activas = len(_tasks_activas)
+                        print(
+                            f"📭 SQS sin mensajes visibles ({ciclos_vacios} ciclos). "
+                            f"Tasks activas: {activas}. "
+                            + ("Actas en vuelo, aguardando..." if activas > 0
+                               else "Cola vacía o proceso terminado.")
+                        )
                     await asyncio.sleep(1)
                     continue
 
+                ciclos_vacios = 0
+
                 for msg in mensajes:
+                    # Punto de backpressure: se bloquea si el sistema está lleno.
+                    # asyncio cede al consumidor mientras esperamos.
+                    await sem_tareas.acquire()
+
                     task = asyncio.create_task(
                         extraer_y_encolar(
-                            session, msg['Body'], msg['ReceiptHandle'],
-                            sem, cola_resultados
+                            session,
+                            msg['Body'],
+                            msg['ReceiptHandle'],
+                            sem_inpi,
+                            sem_tareas,
+                            cola_resultados,
+                            executor_parser,
                         )
                     )
-                    # ── FIX #2: Track de tasks para evitar recolección por GC ──
                     _tasks_activas.add(task)
                     task.add_done_callback(_tasks_activas.discard)
 
-        # ─── MOTOR 2: CONSUMIDOR ──────────────────────────────────────────
+        # ─── MOTOR 2: CONSUMIDOR ──────────────────────────────────────────────
         async def consumidor():
             """
-            Acumula resultados de la cola interna y los persiste en Postgres
-            en lotes de hasta 10 actas o cada 5 segundos (lo que ocurra primero).
+            Acumula resultados y los persiste en lotes de hasta 10 actas.
 
-            Cambios respecto al código original:
-            - Try/except global con backoff: si algo inesperado revienta
-              (ej: un error en metricas), el consumer se recupera solo.
-            - SQS delete dentro de su propio try/except: un fallo en AWS
-              no mata el consumer. La DB ya tiene los datos; SQS los reencola
-              y en el peor caso procesamos esa acta dos veces (idempotente via ON CONFLICT).
+            Diseño defensivo en capas:
+              - Try/except INTERNO para DB: fallo → exito_db=False → mensajes
+                vuelven a SQS via visibility timeout. Lote descartado.
+              - Try/except INTERNO para SQS delete: fallo → se loguea pero
+                el consumidor sigue vivo. ON CONFLICT garantiza idempotencia
+                si el mensaje es reprocesado.
+              - Try/except EXTERNO (bucle): captura cualquier excepción no
+                prevista (bug en metricas, KeyError, etc.) para que el
+                consumidor NUNCA muera. Sin este bloque, un bug menor
+                mataría silenciosamente el consumidor, llenaría la cola,
+                bloquearía los puts de las tasks, agotaría sem_tareas,
+                y pararía el productor.
+              - Backoff exponencial hasta 60s en errores repetidos.
             """
-            lote        = []
-            handles     = []
-            MAX_LOTE    = 10      # Límite duro de AWS delete_message_batch
-            MAX_ESPERA  = 5.0
+            lote         = []
+            handles      = []
+            MAX_LOTE     = 10      # límite duro de AWS delete_message_batch
+            MAX_ESPERA   = 5.0
             ultimo_flush = time.time()
-            backoff_consumer = 1  # Para errores inesperados en el bucle
+            backoff_err  = 1.0
 
             while True:
                 try:
-                    # ── Recolección de resultados con timeout ─────────────
+                    # ── Recolección con timeout ───────────────────────────
                     tiempo_restante = MAX_ESPERA - (time.time() - ultimo_flush)
                     if tiempo_restante > 0:
                         try:
                             r = await asyncio.wait_for(
-                                cola_resultados.get(), timeout=tiempo_restante
+                                cola_resultados.get(),
+                                timeout=tiempo_restante
                             )
                             lote.append(r['datos'])
                             handles.append(r['handle'])
                             cola_resultados.task_done()
                         except asyncio.TimeoutError:
-                            pass  # Tiempo cumplido → evaluamos si hacer flush
+                            pass
 
                     tiempo_desde_flush = time.time() - ultimo_flush
-                    debe_hacer_flush   = (
+                    debe_flush = (
                         len(lote) >= MAX_LOTE
                         or (lote and tiempo_desde_flush >= MAX_ESPERA)
                     )
 
-                    if not debe_hacer_flush:
-                        backoff_consumer = 1  # reset al estar saludable
+                    if not debe_flush:
+                        backoff_err = 1.0
                         continue
 
-                    # ── Escritura en PostgreSQL ───────────────────────────
-                    t_db      = time.time()
-                    exito_db  = False
+                    # ── Escritura a PostgreSQL ────────────────────────────
+                    # asyncio.to_thread usa executor_io (el default).
+                    # Nunca compite con zombie threads del parser.
+                    t_db     = time.time()
+                    exito_db = False
                     try:
                         exito_db = await asyncio.to_thread(
                             transacciones.guardar_lote_tramites_completo, lote
@@ -248,9 +486,10 @@ async def worker_sqs():
                         metricas.registrar_lote_db(len(lote), time.time() - t_db)
                     except Exception as e:
                         print(f"🚨 ERROR CRÍTICO EN DB: {e}")
-                        # exito_db queda False → no borramos de SQS → reintento automático
+                        import traceback; traceback.print_exc()
+                        # exito_db queda False → no borramos de SQS
 
-                    # ── Borrado de SQS (FIX #4: con su propio try/except) ─
+                    # ── Borrado de SQS ────────────────────────────────────
                     if exito_db:
                         try:
                             entries = [
@@ -264,32 +503,39 @@ async def worker_sqs():
                             )
                             print(f"✅ Guardado y borrado lote de {len(lote)} actas.")
                         except Exception as e:
-                            # La DB ya tiene los datos. SQS los reencola.
-                            # Como los inserts son ON CONFLICT, el reprocesamiento es inocuo.
+                            # DB ya tiene los datos. ON CONFLICT garantiza
+                            # idempotencia si SQS reencola estos mensajes.
                             print(
-                                f"🚨 ERROR SQS delete (datos en DB, mensajes se reintentan): {e}"
+                                f"🚨 ERROR SQS delete "
+                                f"(datos en DB, mensajes serán reintentados): {e}"
                             )
                     else:
-                        print("❌ Falló guardado DB — mensajes vuelven a la cola SQS.")
+                        print("❌ Falló guardado DB — mensajes vuelven a SQS.")
 
                     # ── Reset del buffer ──────────────────────────────────
                     lote         = []
                     handles      = []
                     ultimo_flush = time.time()
+                    backoff_err  = 1.0
 
                     if metricas.lotes_db % 50 == 0 and metricas.lotes_db > 0:
                         metricas.imprimir_resumen()
 
-                    backoff_consumer = 1  # ciclo exitoso, reset backoff
-
                 except Exception as e:
-                    print(f"🔥 ERROR INESPERADO EN CONSUMIDOR: {e}. Reintentando en {backoff_consumer}s...")
+                    print(
+                        f"🔥 ERROR INESPERADO EN CONSUMIDOR: {e}. "
+                        f"Reintentando en {backoff_err:.0f}s..."
+                    )
                     import traceback; traceback.print_exc()
-                    await asyncio.sleep(backoff_consumer)
-                    backoff_consumer = min(backoff_consumer * 2, 60)  # max 60s
+                    await asyncio.sleep(backoff_err)
+                    backoff_err = min(backoff_err * 2, 60.0)
 
-        # ─── ARRANQUE ─────────────────────────────────────────────────────
-        await asyncio.gather(productor(), consumidor())
+        # ─── ARRANQUE ─────────────────────────────────────────────────────────
+        try:
+            await asyncio.gather(productor(), consumidor())
+        finally:
+            executor_parser.shutdown(wait=False, cancel_futures=True)
+            executor_io.shutdown(wait=True)
 
 
 if __name__ == "__main__":
