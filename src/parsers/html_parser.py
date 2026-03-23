@@ -250,8 +250,12 @@ def parsear_detalle_html(html, nro_acta):
     # ── Salvavidas de Logs (Auditoría estructural) ──
     if clase_raw is None:
         print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontró CLASE. Se guardará como NULL.")
-    if denominacion_raw is None:
-        print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontró DENOMINACIÓN.")
+    
+    es_figurativa = tipo_marca_raw and "FIGURATIVA" in tipo_marca_raw.upper()
+    
+    if denominacion_raw is None and not es_figurativa:
+        tipo_str = tipo_marca_raw.strip() if tipo_marca_raw else "DESCONOCIDO"
+        print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontró DENOMINACIÓN (Tipo: {tipo_str}).")
 
     # ── Armado del Diccionario ──
     datos = {
