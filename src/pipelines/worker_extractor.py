@@ -126,6 +126,12 @@ async def worker_sqs():
                     )
                     for msg in mensajes
                 ]
+                resultados_gather = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for res in resultados_gather:
+                    if isinstance(res, Exception):
+                        print(f"🔥 ERROR FATAL EN WORKER (Atrapado a tiempo): {repr(res)}")
+                        
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         # ─── MOTOR 2: EL CONSUMIDOR (Habla con PostgreSQL y SQS) ────

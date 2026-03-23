@@ -44,7 +44,6 @@ async def obtener_html_detalle(session, nro_acta, proxy=None):
             if response.status == 200:
                 html = await response.text()
                 metricas.registrar_html(html, time.time() - t0, response.status)
-
                 return html
     except Exception:
         metricas.registrar_error(reintento=False)
@@ -56,11 +55,14 @@ async def obtener_html_detalle(session, nro_acta, proxy=None):
 def obtener_texto_vista(id_vista):
     """
     [SYNC] Obtiene el texto de una vista.
-    Se mantiene con 'requests' porque es llamado dentro de la lógica de negocio sincrónica.
+    Si el INPI no responde en 15 segundos o tira error, EXPLOTA a propósito.
+    Esto permite que el worker aborte el acta completa y SQS la mande a reintentar
+    más tarde, garantizando que NO se pierda información.
     """
-    try:
-        res = requests.get(URL_DETALLE_VISTA, headers=HEADERS, params={"Cod_VistaExp": id_vista}, timeout=10)
-        return res.text if res.status_code == 200 else ""
-    except Exception as e:
-        print(f"⚠️ Error obteniendo vista {id_vista}: {e}")
-        return ""
+    # Usamos timeout=15.0 para no secuestrar el hilo de Python para siempre
+    res = requests.get(URL_DETALLE_VISTA, headers=HEADERS, params={"Cod_VistaExp": id_vista}, timeout=15.0)
+    
+    # raise_for_status() hace que la función estalle si el INPI devuelve 404, 500, 503, etc.
+    res.raise_for_status() 
+    
+    return res.text
