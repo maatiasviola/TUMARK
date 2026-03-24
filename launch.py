@@ -9,17 +9,23 @@ import signal
 
 FASES = {
     "fase1": {
+        "chunks": [("2024-01-01", "2024-01-03")],
+        "n_workers": 1,
+        #"env": {"CONCURRENCIA": "5", "DELAY_MIN": "1.0", "DELAY_MAX": "3.0"},
+        "env": {"CONCURRENCIA": "5", "DELAY_MIN": "0.5", "DELAY_MAX": "1.5"},
+    },
+    "fase2": {
         "chunks": [("2024-01-01", "2024-01-07")],
         "n_workers": 1,
         #"env": {"CONCURRENCIA": "5", "DELAY_MIN": "1.0", "DELAY_MAX": "3.0"},
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "0.5", "DELAY_MAX": "1.5"},
     },
-    "fase2": {
+    "fase3": {
         "chunks": [("2024-01-01", "2024-01-31")],
         "n_workers": 1,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "0.5", "DELAY_MAX": "1.5"},
     },
-    "fase3": {
+    "fase5": {
         "chunks": [
             ("2000-01-01", "2004-12-31"),
             ("2005-01-01", "2009-12-31"),

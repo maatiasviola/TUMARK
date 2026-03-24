@@ -174,7 +174,24 @@ def guardar_lote_tramites_completo(lista_datos_raw):
 
             # ── FASE 6: Bulk Actas_Titulares ──
             if titulares_a_vincular:
-                execute_values(cur, "INSERT INTO actas_titulares (nro_acta, id_titular, porcentaje) VALUES %s ON CONFLICT (nro_acta, id_titular) DO UPDATE SET porcentaje = EXCLUDED.porcentaje;", titulares_a_vincular)
+                # 1. Creamos una nueva lista para guardar las relaciones con el ID interno
+                titulares_a_vincular_idacta = []
+                
+                # 2. Recorremos los titulares que íbamos a vincular
+                for nro_acta, id_titular, porcentaje in titulares_a_vincular:
+                    # Buscamos el ID de acta generado en la Fase 5
+                    id_a_interno = map_nroacta_idacta.get(nro_acta)
+                    
+                    if id_a_interno:
+                        titulares_a_vincular_idacta.append((id_a_interno, id_titular, porcentaje))
+
+                # 3. Insertamos usando la nueva lista y las nuevas columnas
+                if titulares_a_vincular_idacta:
+                    execute_values(
+                        cur, 
+                        "INSERT INTO actas_titulares (id_acta, id_titular, porcentaje) VALUES %s ON CONFLICT (id_acta, id_titular) DO UPDATE SET porcentaje = EXCLUDED.porcentaje;", 
+                        titulares_a_vincular_idacta
+                    )
 
             # ── FASE 7: Bulk Oposiciones y Vistas ──
             oposiciones_para_insertar = []

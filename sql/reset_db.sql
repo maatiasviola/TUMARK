@@ -115,10 +115,10 @@ CREATE TABLE actas_subitems (
 );
 
 CREATE TABLE actas_titulares (
-    nro_acta INT REFERENCES actas(nro_acta),
+    id_acta INT REFERENCES actas(id_acta),
     id_titular INT REFERENCES titulares(id_titular),
     porcentaje DECIMAL,
-    PRIMARY KEY (nro_acta, id_titular)
+    PRIMARY KEY (id_acta, id_titular)
 );
 
 CREATE TABLE oposiciones (
