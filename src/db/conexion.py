@@ -49,6 +49,29 @@ def init_pg_pool():
         # Piscina elástica: Mínimo 1, Máximo 20 conexiones TCP físicas.
         _pg_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, settings.DB_URI)
 
+def init_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=15, # Ajusta según tu IO_WORKERS
+            host=settings.DB_HOST,
+            database=settings.DB_NAME,
+            user=settings.DB_USER,
+            password=settings.DB_PASSWORD,
+            port=settings.DB_PORT,
+            
+            # ─── ESTA ES LA DEFENSA CONTRA EL CONGELAMIENTO ───
+            connect_timeout=10,                      # Falla rápido si no puede conectar al inicio
+            options="-c statement_timeout=30000",    # Mata cualquier query que tarde más de 30 segundos
+            keepalives=1,                            # Activa los pings TCP a nivel de sistema operativo
+            keepalives_idle=30,                      # Segundos de inactividad antes del primer ping
+            keepalives_interval=10,                  # Segundos entre cada ping de comprobación
+            keepalives_count=5                       # Pings fallidos antes de dar la conexión por muerta
+        )
+        print("✅ Pool de PostgreSQL inicializado con blindaje de red.")
+
+
 def get_pg_conn():
     """Obtiene una conexión reciclable."""
     global _pg_pool

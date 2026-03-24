@@ -116,6 +116,17 @@ from src.config import settings
 from src.db.metricas_ingesta import metricas
 from src.servicios import servicio_imagen
 
+import faulthandler
+import signal
+
+# Habilita volcado de pila en caso de segfault o error crítico
+faulthandler.enable()
+
+# Permite forzar un volcado de la memoria y ver en qué línea exacta está cada hilo 
+# ejecutando el comando desde tu EC2: kill -SIGUSR1 <PID_DEL_PROCESO>
+if hasattr(signal, 'SIGUSR1'):
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+
 # ── Configuración ─────────────────────────────────────────────────────────────
 SQS_QUEUE_URL       = settings.SQS_QUEUE_URL
 CONCURRENCIA_MAXIMA = int(os.environ.get("CONCURRENCIA",      "5"))
@@ -148,6 +159,34 @@ sqs = boto3.client(
     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
     region_name=settings.AWS_REGION
 )
+
+async def watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, tasks_activas):
+    """Monitorea signos vitales y detecta cuellos de botella en tiempo real."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            
+            # Cálculo de hilos ocupados
+            io_queue = executor_io._work_queue.qsize()
+            parser_queue = executor_parser._work_queue.qsize()
+            
+            print(
+                f"📊 [WATCHDOG] Estado del Sistema:\n"
+                f"   ├─ Tareas en vuelo (semáforo): {MAX_TAREAS_VUELO - sem_tareas._value}/{MAX_TAREAS_VUELO}\n"
+                f"   ├─ Tasks de asyncio activas  : {len(tasks_activas)}\n"
+                f"   ├─ Cola resultados interna   : {cola_resultados.qsize()}/200\n"
+                f"   ├─ IO Workers encolados      : {io_queue} (Si crece, DB/SQS están lentos/colgados)\n"
+                f"   └─ Parser Workers encolados  : {parser_queue}"
+            )
+            
+            # Alarma crítica de Deadlock
+            if cola_resultados.qsize() >= 200:
+                print("🚨 ALERTA: Cola de resultados LLENA. El consumidor está muerto o bloqueado.")
+                
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"⚠️ Error en watchdog: {e}")
 
 
 def crear_ssl_context():
@@ -532,8 +571,12 @@ async def worker_sqs():
 
         # ─── ARRANQUE ─────────────────────────────────────────────────────────
         try:
-            await asyncio.gather(productor(), consumidor())
+            tarea_watchdog = asyncio.create_task(
+                watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, _tasks_activas)
+            )
+            await asyncio.gather(productor(), consumidor(), tarea_watchdog)
         finally:
+            tarea_watchdog.cancel()
             executor_parser.shutdown(wait=False, cancel_futures=True)
             executor_io.shutdown(wait=True)
 

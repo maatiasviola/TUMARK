@@ -9,6 +9,13 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 DB_URI = os.getenv("DATABASE_URL")  # La de postgresql:// para vectores
 BUCKET_LOGOS = "TUMARK"       # El nombre de tu bucket en Supabase
 
+DB_USER=os.getenv("DB_USER")
+DB_PASSWORD=os.getenv("DB_PASSWORD")
+DB_HOST=os.getenv("DB_HOST")
+DB_PORT=os.getenv("DB_PORT")
+DB_NAME=os.getenv("DB_NAME")
+
+
 # RUTAS
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR_TEMPORAL = os.path.join(BASE_DIR, "..", "temp_downloads")
