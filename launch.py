@@ -88,6 +88,15 @@ def split_daterange(start: str, end: str, n: int) -> list[tuple[str, str]]:
 
 def build_user_data(env: dict, fecha_desde: str, fecha_hasta: str, worker_id: int) -> str:
     env_exports = "\n".join(f'export {k}="{v}"' for k, v in env.items())
+    
+    # 1. Leemos tu archivo .env local para mandárselo a la EC2
+    try:
+        with open(".env", "r") as f:
+            dot_env_content = f.read()
+    except FileNotFoundError:
+        dot_env_content = ""
+        print("⚠️ ADVERTENCIA: No se encontró el archivo .env local.")
+
     script = f"""#!/bin/bash
 set -e
 exec > /var/log/worker-init.log 2>&1
@@ -103,12 +112,18 @@ yum install -y git python3 python3-pip
 cd /home/ec2-user
 git clone {REPO_URL} app
 cd app
+
+# 2. Inyectamos las credenciales seguras en la EC2
+cat << 'EOF' > .env
+{dot_env_content}
+EOF
+
 pip3 install -r requirements.txt
 
-# Lanza el worker
+# 3. Lanzamos el worker
 python3 -m src.pipelines.worker_extractor >> /var/log/worker.log 2>&1
 
-# Auto-terminar
+# 4. Auto-terminar cuando el script finaliza o muere
 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region {AWS_REGION}
 """
@@ -224,11 +239,51 @@ def launch_fase(fase_name: str, dry_run: bool = False):
     signal.signal(signal.SIGINT, apagar)
     signal.signal(signal.SIGTERM, apagar)
 
-    for p in procesos_poblar:
-        p.wait()
-        print(f"  ✅ [poblar] PID {p.pid} finalizó exitosamente.")
+    print("\n" + "="*55)
+    print("  📊 PANEL DE MONITOREO EN VIVO")
+    print("  (Presioná Ctrl+C para salir del monitor sin afectar a las EC2)")
+    print("="*55 + "\n")
 
-    print("\n  🏁 Todo el trabajo de encolado local terminó.")
+    # Usamos el cliente SQS para ver la cola en tiempo real
+    sqs = boto3.client(
+        'sqs',
+        region_name=AWS_REGION,
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
+    )
+    
+    # Importante: Asegurate de tener SQS_QUEUE_URL en tu .env o settings.py
+    queue_url = settings.SQS_QUEUE_URL
+
+    while True:
+        try:
+            # 1. Consultamos el estado de la cola
+            response = sqs.get_queue_attributes(
+                QueueUrl=queue_url,
+                AttributeNames=['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible']
+            )
+            visibles = int(response['Attributes']['ApproximateNumberOfMessages'])
+            en_vuelo = int(response['Attributes']['ApproximateNumberOfMessagesNotVisible'])
+
+            # 2. Revisamos si tus procesos locales siguen inyectando actas
+            vivos = [p for p in procesos_poblar if p.poll() is None]
+            estado_poblado = f"⏳ Poblando ({len(vivos)} activos)" if vivos else "✅ Poblado finalizado"
+
+            # 3. Imprimimos la línea de estado
+            ahora = datetime.now().strftime('%H:%M:%S')
+            print(f"  [{ahora}] {estado_poblado} | SQS Esperando: {visibles} | EC2 Procesando: {en_vuelo}")
+
+            # 4. Condición de éxito: Terminó de poblar y la cola está en cero
+            if not vivos and visibles == 0 and en_vuelo == 0:
+                print("\n  🎉 ¡INGESTA COMPLETADA! La cola SQS está vacía.")
+                print("  Las máquinas EC2 detectarán la falta de trabajo y se apagarán solas.")
+                break
+
+            time.sleep(60)
+
+        except Exception as e:
+            print(f"  ⚠️ Error consultando estado (reintentando en breve): {e}")
+            time.sleep(60)
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
