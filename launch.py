@@ -89,13 +89,12 @@ def split_daterange(start: str, end: str, n: int) -> list[tuple[str, str]]:
 def build_user_data(env: dict, fecha_desde: str, fecha_hasta: str, worker_id: int) -> str:
     env_exports = "\n".join(f'export {k}="{v}"' for k, v in env.items())
     
-    # 1. Leemos tu archivo .env local para mandárselo a la EC2
+    # Leemos el .env local
     try:
         with open(".env", "r") as f:
             dot_env_content = f.read()
     except FileNotFoundError:
         dot_env_content = ""
-        print("⚠️ ADVERTENCIA: No se encontró el archivo .env local.")
 
     script = f"""#!/bin/bash
 set -e
@@ -106,24 +105,27 @@ export FECHA_DESDE="{fecha_desde}"
 export FECHA_HASTA="{fecha_hasta}"
 export WORKER_ID="{worker_id}"
 
-yum update -y
-yum install -y git python3 python3-pip
+# 1. COMANDOS DE UBUNTU (apt en lugar de yum)
+apt-get update -y
+apt-get install -y git python3 python3-pip
 
-cd /home/ec2-user
+# 2. CARPETA DE UBUNTU (no más ec2-user)
+cd /home/ubuntu
 git clone {REPO_URL} app
 cd app
 
-# 2. Inyectamos las credenciales seguras en la EC2
+# 3. Inyectamos las credenciales seguras en la EC2
 cat << 'EOF' > .env
 {dot_env_content}
 EOF
 
-pip3 install -r requirements.txt
+# 4. Instalamos librerías (Ubuntu moderno requiere esta flag extra)
+pip3 install -r requirements.txt --break-system-packages
 
-# 3. Lanzamos el worker
+# 5. Lanzamos el worker
 python3 -m src.pipelines.worker_extractor >> /var/log/worker.log 2>&1
 
-# 4. Auto-terminar cuando el script finaliza o muere
+# 6. Auto-terminar
 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region {AWS_REGION}
 """
