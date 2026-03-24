@@ -1,12 +1,11 @@
 import re
 import json
-import time
 from datetime import datetime
 from bs4 import BeautifulSoup
 from src.clientes.inpi_marcas import obtener_texto_vista
 
 # ──────────────────────────────────────────────────────────────────────────
-# 1. UTILIDADES DE FECHAS (Intactas)
+# 1. UTILIDADES DE FECHAS
 # ──────────────────────────────────────────────────────────────────────────
 
 def limpiar_fecha_ms(date_str):
@@ -61,41 +60,42 @@ def limpiar_lista_tramites(lista):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2. MOTOR DE EXTRACCIÓN SEGURO (NUEVO)
+# 2. MOTOR DE EXTRACCIÓN SECCIONADO (Solución de Claude)
 # ──────────────────────────────────────────────────────────────────────────
 
-def extraer_valor_seguro(soup, etiqueta):
+def extraer_de_seccion(soup, accordion_id, etiqueta, valor_nulo="----"):
     """
-    Busca estrictamente en el texto del label (ignorando los valores).
-    Rendimiento optimizado para un solo recorrido. Reemplaza a extraer_valor_flexible.
+    Extrae un campo buscando SOLO dentro del accordion indicado.
+    Evita ambigüedades cuando la misma etiqueta (ej: 'NRO:') existe en múltiples secciones.
     """
+    seccion = soup.find(id=accordion_id)
+    if not seccion:
+        return None
+        
     clave = etiqueta.replace(":", "").strip().upper()
     
-    for label in soup.find_all('label'):
-        # 1. Extraemos SOLO el texto directo del label (sin los hijos)
+    for label in seccion.find_all('label'):
         textos_directos = [t for t in label.find_all(string=True, recursive=False)]
-        texto_label_limpio = " ".join(textos_directos).replace('\xa0', ' ').strip().upper()
+        texto = " ".join(textos_directos).replace('\xa0', ' ').strip().upper()
         
-        # 2. Match estricto
-        if texto_label_limpio.startswith(clave) or f"{clave}:" in texto_label_limpio:
+        # Match exacto para evitar que "NRO DE EFECTOR" matchee "NRO"
+        if texto == clave or texto == f"{clave}:":
             span = label.find('span')
             if span:
                 valor = span.get_text().strip()
-                return valor if valor and valor != "----" else None
-            
-            # Plan B: Sin <span>. Cortamos SOLO en el primer ":"
+                return valor if valor and valor != valor_nulo else None
+                
+            # Fallback sin span
             texto_completo = label.get_text().replace('\xa0', ' ').strip()
-            partes = texto_completo.split(":", 1) 
+            partes = texto_completo.split(":", 1)
             if len(partes) > 1:
                 valor = partes[1].strip()
-                return valor if valor and valor != "----" else None
+                return valor if valor and valor != valor_nulo else None
                 
     return None
 
 def extraer_valor_flexible_elemento(elemento_label):
-    """
-    Se mantiene para extraer_titulares_multiples que pasa el objeto label directo.
-    """
+    """Mantenido para extraer_titulares_multiples que pasa el objeto label directo."""
     if not elemento_label: return ""
     span = elemento_label.find('span', class_='text-danger')
     if span: 
@@ -107,7 +107,23 @@ def extraer_valor_flexible_elemento(elemento_label):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 3. EXTRACCIONES ESPECÍFICAS (Intactas)
+# 3. REGLAS LEGALES DE MARCAS (Solución de Claude)
+# ──────────────────────────────────────────────────────────────────────────
+
+TIPOS_SIN_DENOMINACION = frozenset([
+    "TRIDIMENSIONAL", "SONORA", "OLFATIVA", "FIGURATIVA",
+    "DE COLOR", "HOLOGRAFICA", "MULTIMEDIAL", "GESTUAL",
+])
+
+def tipo_requiere_denominacion(tipo_marca_str):
+    """Retorna False para tipos de marca que legalmente no llevan denominación textual."""
+    if not tipo_marca_str:
+        return True  # desconocido → reportar igual, podría ser un error real
+    return tipo_marca_str.strip().upper() not in TIPOS_SIN_DENOMINACION
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 4. EXTRACCIONES ESPECÍFICAS
 # ──────────────────────────────────────────────────────────────────────────
 
 def extraer_disposicion(soup):
@@ -185,7 +201,7 @@ def extraer_titulares_multiples(soup):
 
         label_cuit = label_nombre.find_next('label', string=re.compile(r"CUIT\s*:", re.I))
         val_cuit = extraer_valor_flexible_elemento(label_cuit)
-        cuit_limpio = "".join(filter(str.isdigit, val_cuit))
+        cuit_limpio = "".join(filter(str.isdigit, val_cuit)) if val_cuit else ""
 
         label_pais = label_nombre.find_next('label', string=re.compile(r"PAIS\s*:", re.I))
         val_pais = extraer_valor_flexible_elemento(label_pais)
@@ -217,7 +233,7 @@ def extraer_nro_oposicion_profundo(html_contenido, nro_acta_filtro=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 4. FUNCIÓN PRINCIPAL (Refactorizada con Pre-asignación y Logs)
+# 5. FUNCIÓN PRINCIPAL 
 # ──────────────────────────────────────────────────────────────────────────
 
 def parsear_detalle_html(html, nro_acta):
@@ -238,22 +254,21 @@ def parsear_detalle_html(html, nro_acta):
                 base = "https://portaltramites.inpi.gob.ar"
                 url_img = base + (src if src.startswith("/") else "/" + src)
 
-    # ── Pre-asignación con el Motor Seguro (Cero falsos positivos) ──
-    denominacion_raw = extraer_valor_seguro(soup, "DENOMINACIÓN:")
-    tipo_marca_raw   = extraer_valor_seguro(soup, "TIPO DE MARCA:")
-    clase_raw        = extraer_valor_seguro(soup, "CLASE:")
-    presentacion_raw = extraer_valor_seguro(soup, "PRESENTACIÓN:")
-    proteccion_raw   = extraer_valor_seguro(soup, "PROTECCION:")
-    limitacion_raw   = extraer_valor_seguro(soup, "LIMITACION:")
-    nro_res_raw      = extraer_valor_seguro(soup, "NRO:")
+    # ── Extracción Seccionada (Evita bugs de colisión de etiquetas) ──
+    denominacion_raw = extraer_de_seccion(soup, "accordion-1", "DENOMINACIÓN:")
+    tipo_marca_raw   = extraer_de_seccion(soup, "accordion-1", "TIPO DE MARCA:")
+    presentacion_raw = extraer_de_seccion(soup, "accordion-1", "PRESENTACIÓN:")
+    clase_raw        = extraer_de_seccion(soup, "accordion-2", "CLASE:")
+    proteccion_raw   = extraer_de_seccion(soup, "accordion-2", "PROTECCION:")
+    limitacion_raw   = extraer_de_seccion(soup, "accordion-2", "LIMITACION:")
+    nro_res_raw      = extraer_de_seccion(soup, "accordion-9", "NRO:") # <--- FIX: Busca NRO solo en Resolución
 
-    # ── Salvavidas de Logs (Auditoría estructural) ──
+    # ── Logs Inteligentes (Evita falsos positivos) ──
     if clase_raw is None:
         print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontró CLASE. Se guardará como NULL.")
     
-    es_figurativa = tipo_marca_raw and "FIGURATIVA" in tipo_marca_raw.upper()
-    
-    if denominacion_raw is None and not es_figurativa:
+    # FIX: Solo alerta si el tipo de marca exige denominación legalmente
+    if denominacion_raw is None and tipo_requiere_denominacion(tipo_marca_raw):
         tipo_str = tipo_marca_raw.strip() if tipo_marca_raw else "DESCONOCIDO"
         print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontró DENOMINACIÓN (Tipo: {tipo_str}).")
 
@@ -277,12 +292,12 @@ def parsear_detalle_html(html, nro_acta):
     texto_proteccion = datos.get('proteccion', '') or ""
     datos['es_clase_completa'] = texto_proteccion.strip().upper() == "TODA LA CLASE"
 
-    # Titulares (con log si fallan)
+    # Titulares
     datos["titulares"] = extraer_titulares_multiples(soup)
     if not datos["titulares"]:
         print(f"   ⚠️ [Acta {nro_acta}] Anomalía Estructural: No se encontraron TITULARES.")
 
-    # ── Vistas y JavaScript (Intacto) ──
+    # ── Vistas y JavaScript ──
     vistas_raw = extraer_datos_js(html, "vistas")
     vistas_finales = []
     for v in vistas_raw:
@@ -299,12 +314,12 @@ def parsear_detalle_html(html, nro_acta):
             else:
                 v_limpio[k] = val
         v_limpio["nro_oposicion_vinculada"] = nro_vinculado
-        v_limpio["Tipo"] = v.get("Tipo", "").strip() if v.get("Tipo") else None # FIX de seguridad por si no viene Tipo
+        v_limpio["Tipo"] = v.get("Tipo", "").strip() if v.get("Tipo") else None
         vistas_finales.append(v_limpio)
 
     datos["vistas"] = vistas_finales
 
-    # ── Otros trámites JS (Intacto) ──
+    # ── Otros trámites JS ──
     datos["oposiciones"] = limpiar_lista_tramites(extraer_datos_js(html, "opos"))
     datos["transferencias"] = limpiar_lista_tramites(extraer_datos_js(html, "transferencias"))
     datos["renuncias"] = limpiar_lista_tramites(extraer_datos_js(html, "Renuncias"))
