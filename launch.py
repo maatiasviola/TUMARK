@@ -4,6 +4,7 @@ import time
 import json
 from datetime import datetime, timedelta
 from typing import Optional
+from src.config import settings
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -200,7 +201,13 @@ def launch_fase(fase_name: str, dry_run: bool = False):
 
     azs = list(AZ_SUBNETS.keys())[:n_workers]
 
-    ec2 = boto3.client("ec2", region_name=AWS_REGION)
+    # 2. Modifica la inicialización del cliente EC2 para usar las credenciales de settings
+    ec2 = boto3.client(
+        "ec2", 
+        region_name=AWS_REGION,
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
+    )
 
     print(f"\n{'='*55}")
     print(f"  Lanzando {fase_name} — {n_workers} workers")
