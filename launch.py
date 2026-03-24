@@ -89,7 +89,6 @@ def split_daterange(start: str, end: str, n: int) -> list[tuple[str, str]]:
 def build_user_data(env: dict, fecha_desde: str, fecha_hasta: str, worker_id: int) -> str:
     env_exports = "\n".join(f'export {k}="{v}"' for k, v in env.items())
     
-    # Leemos el .env local
     try:
         with open(".env", "r") as f:
             dot_env_content = f.read()
@@ -97,37 +96,53 @@ def build_user_data(env: dict, fecha_desde: str, fecha_hasta: str, worker_id: in
         dot_env_content = ""
 
     script = f"""#!/bin/bash
+# 1. Enviar logs a la consola web de AWS (Para ver los errores sin usar SSH)
+exec > >(tee /var/log/worker-init.log /dev/console) 2>&1
+
+echo "🚀 INICIANDO SETUP DE INSTANCIA WORKER..."
+
+# 2. SISTEMA DE AUTO-DESTRUCCIÓN GARANTIZADA
+auto_terminar() {{
+    echo "🛑 Ejecutando auto-terminación de la instancia..."
+    # Obtener Token seguro de AWS (IMDSv2)
+    TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
+    INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+    
+    # Ordenar apagado y destrucción
+    aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region {AWS_REGION} || true
+}}
+
+# La instrucción 'trap' asegura que 'auto_terminar' se ejecute SIEMPRE al final, falle o no el script.
+trap auto_terminar EXIT
 set -e
-exec > /var/log/worker-init.log 2>&1
 
 {env_exports}
 export FECHA_DESDE="{fecha_desde}"
 export FECHA_HASTA="{fecha_hasta}"
 export WORKER_ID="{worker_id}"
 
-# 1. COMANDOS DE UBUNTU (apt en lugar de yum)
+echo "📦 Instalando dependencias (incluyendo libpq-dev para PostgreSQL)..."
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y git python3 python3-pip
+apt-get install -y git python3 python3-pip libpq-dev python3-dev awscli
 
-# 2. CARPETA DE UBUNTU (no más ec2-user)
+echo "🐙 Clonando repositorio..."
 cd /home/ubuntu
 git clone {REPO_URL} app
 cd app
 
-# 3. Inyectamos las credenciales seguras en la EC2
+echo "🔐 Inyectando archivo .env..."
 cat << 'EOF' > .env
 {dot_env_content}
 EOF
 
-# 4. Instalamos librerías (Ubuntu moderno requiere esta flag extra)
+echo "🐍 Instalando librerías de Python..."
 pip3 install -r requirements.txt --break-system-packages
 
-# 5. Lanzamos el worker
-python3 -m src.pipelines.worker_extractor >> /var/log/worker.log 2>&1
+echo "⚙️ Ejecutando Worker..."
+python3 -m src.pipelines.worker_extractor
 
-# 6. Auto-terminar
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region {AWS_REGION}
+echo "✅ Worker finalizado. Procediendo a destruir la máquina."
 """
     return script
 
