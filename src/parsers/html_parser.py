@@ -242,6 +242,14 @@ def parsear_detalle_html(html, nro_acta):
 
     soup = BeautifulSoup(html, 'html.parser')
 
+    # Vamos a buscar el Invariante (La fecha de presentación)
+    presentacion_raw = extraer_de_seccion(soup, "accordion-1", "PRESENTACIÓN:")
+    
+    if not presentacion_raw:
+        # Si no hay fecha, abortamos la misión en el milisegundo 1.
+        print(f"   🛑 [Acta {nro_acta}] INVARIANTE ROTO: HTML fantasma. Forzando reintento de red...")
+        raise ValueError(f"Falso HTTP 200: Acta {nro_acta} recibida sin datos esenciales.")
+
     # Extracción de Imagen
     img_tag = soup.find(id="logo")
     url_img = None
@@ -257,7 +265,6 @@ def parsear_detalle_html(html, nro_acta):
     # ── Extracción Seccionada (Evita bugs de colisión de etiquetas) ──
     denominacion_raw = extraer_de_seccion(soup, "accordion-1", "DENOMINACIÓN:")
     tipo_marca_raw   = extraer_de_seccion(soup, "accordion-1", "TIPO DE MARCA:")
-    presentacion_raw = extraer_de_seccion(soup, "accordion-1", "PRESENTACIÓN:")
     clase_raw        = extraer_de_seccion(soup, "accordion-2", "CLASE:")
     proteccion_raw   = extraer_de_seccion(soup, "accordion-2", "PROTECCION:")
     limitacion_raw   = extraer_de_seccion(soup, "accordion-2", "LIMITACION:")
