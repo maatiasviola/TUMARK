@@ -66,32 +66,50 @@ def limpiar_lista_tramites(lista):
 def extraer_de_seccion(soup, accordion_id, etiqueta, valor_nulo="----"):
     """
     Extrae un campo buscando SOLO dentro del accordion indicado.
-    Evita ambigüedades cuando la misma etiqueta (ej: 'NRO:') existe en múltiples secciones.
+    
+    Maneja los dos formatos de label que usa el INPI:
+    
+      Forma A — valor en <span> (CLASE, PROTECCION, NOMBRE...):
+        <label>CLASE: <span class="text-danger"> 41</span></label>
+        → texto_directo = "CLASE:"  → match exacto con f"{clave}:"
+        
+      Forma B — valor inline sin <span> (LIMITACION, DNI, GENERO...):
+        <label>LIMITACION: ACADEMIAS [EDUCACIÓN] ;</label>
+        → texto_directo = "LIMITACION: ACADEMIAS [EDUCACIÓN] ;"
+        → el match exacto falla, necesita startswith(f"{clave}:")
+    
+    Por qué startswith con el colon es seguro para evitar colisiones:
+        "NRO DE EFECTOR:".startswith("NRO:") → False  ✓
+        "NRO:".startswith("NRO:")            → True   ✓
+        El colon ancla el match: no hay falsos positivos por prefijos.
     """
     seccion = soup.find(id=accordion_id)
     if not seccion:
         return None
-        
+
     clave = etiqueta.replace(":", "").strip().upper()
-    
+
     for label in seccion.find_all('label'):
         textos_directos = [t for t in label.find_all(string=True, recursive=False)]
         texto = " ".join(textos_directos).replace('\xa0', ' ').strip().upper()
-        
-        # Match exacto para evitar que "NRO DE EFECTOR" matchee "NRO"
-        if texto == clave or texto == f"{clave}:":
+
+        # ← CAMBIO: agregar la tercera condición para Forma B
+        if texto == clave or texto == f"{clave}:" or texto.startswith(f"{clave}:"):
             span = label.find('span')
             if span:
+                # Forma A: valor en el span
                 valor = span.get_text().strip()
                 return valor if valor and valor != valor_nulo else None
-                
-            # Fallback sin span
-            texto_completo = label.get_text().replace('\xa0', ' ').strip()
-            partes = texto_completo.split(":", 1)
-            if len(partes) > 1:
-                valor = partes[1].strip()
+
+            # Forma B y C (vacío): valor está en el texto inline
+            # Usamos el texto ORIGINAL (no uppercased) para preservar el casing
+            # y buscamos por posición para no partir en el primer ":" del valor
+            texto_original = label.get_text(separator=' ').replace('\xa0', ' ').strip()
+            idx = texto_original.upper().find(f"{clave}:")
+            if idx >= 0:
+                valor = texto_original[idx + len(clave) + 1:].strip()
                 return valor if valor and valor != valor_nulo else None
-                
+
     return None
 
 def extraer_valor_flexible_elemento(elemento_label):
