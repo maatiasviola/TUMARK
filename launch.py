@@ -8,7 +8,7 @@ from src.config import settings
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-AWS_REGION = "us-east-1"
+AWS_REGION = "us-east-2"
 
 # Subnets en distintas AZs — reemplazá con los tuyos
 AZ_SUBNETS = {
