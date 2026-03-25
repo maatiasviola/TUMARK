@@ -21,7 +21,7 @@ AZ_SUBNETS = {
 }
 
 EC2_CONFIG = {
-    "ImageId": "ami-0198cdf7458a7a932",   
+    "ImageId": "ami-07062e2a343acc423",   
     "InstanceType": "t3.micro",
     "KeyName": "claves",
     "SecurityGroupIds": ["sg-0635d80d0a92052ea"],
@@ -86,68 +86,59 @@ def split_daterange(start: str, end: str, n: int) -> list[tuple[str, str]]:
         cursor = chunk_end + timedelta(days=1)
     return chunks
 
-def build_user_data(env: dict, fecha_desde: str, fecha_hasta: str, worker_id: int) -> str:
+def build_user_data_debug(env: dict, fecha_desde: str, fecha_hasta: str, worker_id: int) -> str:
     env_exports = "\n".join(f'export {k}="{v}"' for k, v in env.items())
-    
+
     try:
-        with open(".env", "r") as f:
-            dot_env_content = f.read()
+        with open(".env", "rb") as f:
+            import base64
+            dot_env_b64 = base64.b64encode(f.read()).decode()
     except FileNotFoundError:
-        dot_env_content = ""
+        dot_env_b64 = ""
 
     script = f"""#!/bin/bash
-# 1. Enviar logs a la consola web de AWS (Para ver los errores sin usar SSH)
 exec > >(tee /var/log/worker-init.log /dev/console) 2>&1
 
-echo "🚀 INICIANDO SETUP DE INSTANCIA WORKER..."
+echo ">>> INICIO DEL SCRIPT - $(date)"
 
-# 2. SISTEMA DE AUTO-DESTRUCCIÓN GARANTIZADA
-auto_terminar() {{
-    echo "🛑 Ejecutando auto-terminación de la instancia..."
-    # Obtener Token seguro de AWS (IMDSv2)
-    TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
-    INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
-    
-    # Ordenar apagado y destrucción
-    aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region {AWS_REGION} || true
-}}
-
-# La instrucción 'trap' asegura que 'auto_terminar' se ejecute SIEMPRE al final, falle o no el script.
-trap auto_terminar EXIT
-set -e
+# SIN set -e y SIN trap auto_terminar para debug
+# set -e   <-- DESHABILITADO
 
 {env_exports}
 export FECHA_DESDE="{fecha_desde}"
 export FECHA_HASTA="{fecha_hasta}"
 export WORKER_ID="{worker_id}"
 
-echo "📦 Instalando dependencias (incluyendo libpq-dev para PostgreSQL)..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y git python3 python3-pip libpq-dev python3-dev awscli
+echo ">>> Paso 1: apt-get update"
+apt-get update -y && echo ">>> apt-get update OK" || echo ">>> apt-get update FALLÓ"
 
-echo "🐙 Clonando repositorio..."
+echo ">>> Paso 2: apt-get install"
+apt-get install -y git python3 python3-pip libpq-dev python3-dev awscli \
+  && echo ">>> install OK" || echo ">>> install FALLÓ"
+
+echo ">>> Paso 3: git clone"
 cd /home/ubuntu
-git clone {REPO_URL} app
+git clone {REPO_URL} app && echo ">>> clone OK" || echo ">>> clone FALLÓ"
+
+echo ">>> Paso 4: Inyectando .env"
 cd app
+echo "{dot_env_b64}" | base64 -d > .env && echo ">>> .env OK" || echo ">>> .env FALLÓ"
 
-echo "🔐 Inyectando archivo .env..."
-cat << 'EOF' > .env
-{dot_env_content}
-EOF
+echo ">>> Paso 5: pip install"
+pip3 install -r requirements.txt --break-system-packages \
+  && echo ">>> pip OK" || echo ">>> pip FALLÓ"
 
-echo "🐍 Instalando librerías de Python..."
-pip3 install -r requirements.txt --break-system-packages
+echo ">>> Paso 6: Ejecutando worker"
+python3 -m src.pipelines.worker_extractor && echo ">>> worker OK" || echo ">>> worker FALLÓ"
 
-echo "⚙️ Ejecutando Worker..."
-python3 -m src.pipelines.worker_extractor
-
-echo "✅ Worker finalizado. Procediendo a destruir la máquina."
+echo ">>> FIN DEL SCRIPT - $(date)"
+# La instancia NO se auto-destruye, queda viva para SSH
 """
     return script
 
+
 def launch_worker(ec2_client, az, subnet_id, env, fecha_desde, fecha_hasta, worker_id, fase_name, dry_run=False):
-    user_data = build_user_data(env, fecha_desde, fecha_hasta, worker_id)
+    user_data = build_user_data_debug(env, fecha_desde, fecha_hasta, worker_id)
     tags = [
         {"Key": "Name",       "Value": f"inpi-{fase_name}-worker-{worker_id}"},
         {"Key": "Fase",       "Value": fase_name},
