@@ -18,7 +18,7 @@ AZ_SUBNETS = {
 
 # Configuración base de la instancia (Adaptada a la sintaxis de boto3)
 EC2_CONFIG = {
-    "ImageId": "ami-00b151c83e0ee448f",   
+    "ImageId": "ami-0b2506a6d768e9978",   
     "InstanceType": "t3.micro",
     "KeyName": "claves",
     "SecurityGroupIds": ["sg-0635d80d0a92052ea"],
@@ -87,25 +87,25 @@ def lanzar_workers_ec2(n_workers, env, nombre_fase):
     # USER DATA con la ruta correcta TUMARK
     user_data_script = f"""#!/bin/bash
 exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-echo "Iniciando configuración del Worker..."
+echo "Iniciando Worker en Producción..."
 
 su - ubuntu -c '
-    # 1. Variables de entorno
+    # 1. Inyectar variables de comportamiento (Concurrencia, etc)
     {env_exports}
     
-    # 2. Ir a la carpeta
+    # 2. Ir al proyecto
     cd /home/ubuntu/TUMARK
     
-    # 3. TRAER EL CÓDIGO NUEVO (Acá se baja el requirements.txt actualizado)
+    # 3. Traer código nuevo (Por si mañana cambiás la lógica de un .py en GitHub)
     git pull origin main
     
-    # 4. Activar el entorno virtual
+    # 4. Activar entorno
     source venv/bin/activate
     
-    # 5. Instalar dependencias (Ahora sí lee el archivo nuevo que bajó en el paso 3)
+    # 5. Instalar librerías nuevas (Solo actuará si el git pull trajo un requirements.txt distinto)
     pip install -r requirements.txt
     
-    # 6. Ejecutar el worker
+    # 6. ¡A trabajar!
     python3 src/pipelines/worker_extractor.py
 '
 """
