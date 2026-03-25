@@ -67,7 +67,8 @@ def lanzar_workers_multi_az(n_workers, env, nombre_fase):
     print(f"\n[2] Solicitando {n_workers} instancias EC2 Spot distribuidas en Multi-AZ...")
     instancias_creadas = []
     
-    env_exports = "\n".join([f"export {k}='{v}'" for k, v in env.items()])
+    worker_env = FASES[nombre_fase]["env"]
+    env_exports = "\n".join([f"export {k}='{v}'" for k, v in worker_env.items()])
     
     # UserData limpio gracias a la Infraestructura Inmutable
     user_data_script = f"""#!/bin/bash
