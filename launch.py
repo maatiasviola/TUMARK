@@ -96,8 +96,17 @@ su - ubuntu -c '
     # 2. Ir a la carpeta
     cd /home/ubuntu/TUMARK
     
-    # 3. Activar y ejecutar
+    # 3. Activar el entorno virtual
     source venv/bin/activate
+    
+    # 4. INSTALAR DEPENDENCIAS (Faltaba esto)
+    # Instalamos psycopg2-binary que es la versión precompilada para evitar errores de C++
+    pip install psycopg2-binary
+    
+    # (Opcional) Si tenés un requirements.txt al día, descomentá la línea de abajo:
+    # pip install -r requirements.txt
+    
+    # 5. Ejecutar el worker
     python3 src/pipelines/worker_extractor.py
 '
 """
