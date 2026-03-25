@@ -81,7 +81,8 @@ def lanzar_workers_ec2(n_workers, env, nombre_fase):
     ec2_client = boto3.client('ec2', region_name=AWS_REGION)
     instancias_creadas = []
     
-    env_exports = "\n".join([f"export {k}='{v}'" for k, v in env.items()])
+    worker_env = FASES[nombre_fase]["env"]
+    env_exports = "\n".join([f"export {k}='{v}'" for k, v in worker_env.items()])
     
     # USER DATA con la ruta correcta TUMARK
     user_data_script = f"""#!/bin/bash
@@ -89,8 +90,13 @@ exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 echo "Iniciando configuración del Worker..."
 
 su - ubuntu -c '
+    # 1. Cargar variables de entorno limpias
     {env_exports}
+    
+    # 2. Ir a la carpeta
     cd /home/ubuntu/TUMARK
+    
+    # 3. Activar y ejecutar
     source venv/bin/activate
     python3 src/pipelines/worker_extractor.py
 '
