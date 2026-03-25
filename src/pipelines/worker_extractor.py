@@ -132,7 +132,7 @@ SQS_QUEUE_URL       = settings.SQS_QUEUE_URL
 CONCURRENCIA_MAXIMA = int(os.environ.get("CONCURRENCIA",      "5"))
 DELAY_MIN           = float(os.environ.get("DELAY_MIN",       "1.0"))
 DELAY_MAX           = float(os.environ.get("DELAY_MAX",       "3.0"))
-PROXY_URL           = os.environ.get("PROXY_URL", None)
+#PROXY_URL           = os.environ.get("PROXY_URL", None)
 MAX_INTENTOS        = int(os.environ.get("MAX_INTENTOS",      "3"))
 
 # ── Timeouts ──────────────────────────────────────────────────────────────────
@@ -228,7 +228,7 @@ async def extraer_y_encolar(
                 async with sem_inpi:
                     html = await asyncio.wait_for(
                         inpi_marcas.obtener_html_detalle(
-                            session, nro_acta, proxy=PROXY_URL
+                            session, nro_acta#, proxy=PROXY_URL
                         ),
                         timeout=25.0
                     )
@@ -378,7 +378,6 @@ async def worker_sqs():
         f"\n   executor_parser    : {PARSER_WORKERS} workers"
         f"\n   executor_io        : {IO_WORKERS} workers"
         f"\n   Delay              : {DELAY_MIN}–{DELAY_MAX}s"
-        f"\n   Proxy              : {'sí' if PROXY_URL else 'no'}"
         f"\n   ⚠️  Asegurar Visibility Timeout SQS >= 700s"
     )
 
