@@ -90,19 +90,19 @@ exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 echo "Iniciando configuración del Worker..."
 
 su - ubuntu -c '
-    # 1. Cargar variables de entorno limpias
+    # 1. Variables de entorno
     {env_exports}
     
     # 2. Ir a la carpeta
     cd /home/ubuntu/TUMARK
     
-    # 3. Traer los últimos cambios si usas Git (Descomentar si aplica)
-    # git pull origin main
+    # 3. TRAER EL CÓDIGO NUEVO (Acá se baja el requirements.txt actualizado)
+    git pull origin main
     
     # 4. Activar el entorno virtual
     source venv/bin/activate
     
-    # 5. INSTALAR DEPENDENCIAS DESDE EL ARCHIVO
+    # 5. Instalar dependencias (Ahora sí lee el archivo nuevo que bajó en el paso 3)
     pip install -r requirements.txt
     
     # 6. Ejecutar el worker
