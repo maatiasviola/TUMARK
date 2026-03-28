@@ -186,6 +186,11 @@ su - ubuntu -c '
             print(f"  ✅ {nombre} → {iid} en {az}")
         except ClientError as e:
             print(f"  ❌ Error en {az}: {e.response['Error']['Message']}")
+        
+        if i < n_workers - 1: # No esperar después del último
+            espera = 45 # Segundos entre cada worker
+            print(f"  ⏳ Esperando {espera}s para el siguiente worker (Staggering)...")
+            time.sleep(espera)
 
     fname = f"instancias_{nombre_fase}.json"
     with open(fname, "w") as f:
