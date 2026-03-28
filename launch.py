@@ -37,7 +37,7 @@ AZ_SUBNETS = {
 }
 
 EC2_CONFIG = {
-    "ImageId":            "ami-076742b894530ab1f",
+    "ImageId":            "ami-07f3d98a74cc82bc2",
     "InstanceType":       "t3.micro",
     "KeyName":            "claves-sp",
     "SecurityGroupIds":   ["sg-017405543db50e7a8"],
