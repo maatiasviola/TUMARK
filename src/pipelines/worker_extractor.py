@@ -477,60 +477,46 @@ async def worker_sqs():
                     task.add_done_callback(_tasks_activas.discard)
 
         # ─── MOTOR 2: CONSUMIDOR ──────────────────────────────────────────────
+        # ─── MOTOR 2: CONSUMIDOR ──────────────────────────────────────────────
         async def consumidor():
             """
             Acumula resultados y los persiste en lotes de hasta 10 actas.
-
-            Diseño defensivo en capas:
-              - Try/except INTERNO para DB: fallo → exito_db=False → mensajes
-                vuelven a SQS via visibility timeout. Lote descartado.
-              - Try/except INTERNO para SQS delete: fallo → se loguea pero
-                el consumidor sigue vivo. ON CONFLICT garantiza idempotencia
-                si el mensaje es reprocesado.
-              - Try/except EXTERNO (bucle): captura cualquier excepción no
-                prevista (bug en metricas, KeyError, etc.) para que el
-                consumidor NUNCA muera. Sin este bloque, un bug menor
-                mataría silenciosamente el consumidor, llenaría la cola,
-                bloquearía los puts de las tasks, agotaría sem_tareas,
-                y pararía el productor.
-              - Backoff exponencial hasta 60s en errores repetidos.
+            Diseño orientado a eventos: CPU 0% garantizado en idle.
             """
             lote         = []
             handles      = []
             MAX_LOTE     = 10      # límite duro de AWS delete_message_batch
             MAX_ESPERA   = 5.0
-            ultimo_flush = time.time()
             backoff_err  = 1.0
 
             while True:
                 try:
-                    # ── Recolección con timeout ───────────────────────────
-                    tiempo_restante = MAX_ESPERA - (time.time() - ultimo_flush)
-                    if tiempo_restante > 0:
+                    # ── 1. Recolección robusta orientada a eventos ────────────
+                    
+                    # Si el lote está vacío, esperamos la primera acta SIN timeout.
+                    # Esto garantiza 0% de uso de CPU si el INPI/Productor está lento.
+                    if not lote:
+                        r = await cola_resultados.get()
+                        lote.append(r['datos'])
+                        handles.append(r['handle'])
+                        cola_resultados.task_done()
+                        tiempo_primer_acta = time.time()
+                    
+                    # Si ya tenemos al menos un acta, intentamos llenar el resto del lote.
+                    # Acá sí aplicamos el timeout para no dejar actas "tumbadas" en memoria.
+                    tiempo_restante = MAX_ESPERA - (time.time() - tiempo_primer_acta)
+                    
+                    while len(lote) < MAX_LOTE and tiempo_restante > 0:
                         try:
-                            r = await asyncio.wait_for(
-                                cola_resultados.get(),
-                                timeout=tiempo_restante
-                            )
+                            r = await asyncio.wait_for(cola_resultados.get(), timeout=tiempo_restante)
                             lote.append(r['datos'])
                             handles.append(r['handle'])
                             cola_resultados.task_done()
+                            tiempo_restante = MAX_ESPERA - (time.time() - tiempo_primer_acta)
                         except asyncio.TimeoutError:
-                            pass
+                            break  # Se acabó el tiempo, salimos del while a flushear lo que tengamos
 
-                    tiempo_desde_flush = time.time() - ultimo_flush
-                    debe_flush = (
-                        len(lote) >= MAX_LOTE
-                        or (lote and tiempo_desde_flush >= MAX_ESPERA)
-                    )
-
-                    if not debe_flush:
-                        backoff_err = 1.0
-                        continue
-
-                    # ── Escritura a PostgreSQL ────────────────────────────
-                    # asyncio.to_thread usa executor_io (el default).
-                    # Nunca compite con zombie threads del parser.
+                    # ── 2. Escritura a PostgreSQL ─────────────────────────────
                     t_db     = time.time()
                     exito_db = False
                     try:
@@ -541,15 +527,11 @@ async def worker_sqs():
                     except Exception as e:
                         print(f"🚨 ERROR CRÍTICO EN DB: {e}")
                         import traceback; traceback.print_exc()
-                        # exito_db queda False → no borramos de SQS
 
-                    # ── Borrado de SQS ────────────────────────────────────
+                    # ── 3. Borrado de SQS y Tags ──────────────────────────────
                     if exito_db:
                         try:
-                            entries = [
-                                {'Id': str(i), 'ReceiptHandle': h}
-                                for i, h in enumerate(handles)
-                            ]
+                            entries = [{'Id': str(i), 'ReceiptHandle': h} for i, h in enumerate(handles)]
                             await asyncio.to_thread(
                                 sqs.delete_message_batch,
                                 QueueUrl=SQS_QUEUE_URL,
@@ -559,41 +541,30 @@ async def worker_sqs():
                             
                             total_procesadas_worker = metricas.lotes_db * MAX_LOTE
                             
-                            # Actualizamos cada 300 actas (30 lotes de 10)
+                            # Actualizamos el Tag EC2 cada 300 actas
                             if total_procesadas_worker > 0 and total_procesadas_worker % 300 == 0:
-                                # Ejecutamos en thread para no bloquear el loop de asyncio
                                 asyncio.create_task(
                                     asyncio.to_thread(
                                         actualizar_estado_ec2, 
                                         total_procesadas_worker, 
-                                        metricas.errores_red + metricas.errores_db
+                                        getattr(metricas, 'actas_error', 0)
                                     )
                                 )
-                        
                         except Exception as e:
-                            # DB ya tiene los datos. ON CONFLICT garantiza
-                            # idempotencia si SQS reencola estos mensajes.
-                            print(
-                                f"🚨 ERROR SQS delete "
-                                f"(datos en DB, mensajes serán reintentados): {e}"
-                            )
+                            print(f"🚨 ERROR SQS delete (datos en DB, mensajes serán reintentados): {e}")
                     else:
                         print("❌ Falló guardado DB — mensajes vuelven a SQS.")
 
-                    # ── Reset del buffer ──────────────────────────────────
-                    lote         = []
-                    handles      = []
-                    ultimo_flush = time.time()
-                    backoff_err  = 1.0
+                    # ── 4. Reset del estado para el próximo ciclo ─────────────
+                    lote        = []
+                    handles     = []
+                    backoff_err = 1.0
 
                     if metricas.lotes_db % 50 == 0 and metricas.lotes_db > 0:
                         metricas.imprimir_resumen()
 
                 except Exception as e:
-                    print(
-                        f"🔥 ERROR INESPERADO EN CONSUMIDOR: {e}. "
-                        f"Reintentando en {backoff_err:.0f}s..."
-                    )
+                    print(f"🔥 ERROR INESPERADO EN CONSUMIDOR: {e}. Reintentando en {backoff_err:.0f}s...")
                     import traceback; traceback.print_exc()
                     await asyncio.sleep(backoff_err)
                     backoff_err = min(backoff_err * 2, 60.0)
