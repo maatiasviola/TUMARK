@@ -109,7 +109,7 @@ def _build_user_data(fase: str, worker_label: str) -> str:
     secretos_necesarios = [
         "DB_URI", "DATABASE_URL", "SQS_QUEUE_URL", 
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", 
-        "SUPABASE_URL", "SUPABASE_KEY"
+        "SUPABASE_URL", "SUPABASE_KEY", "AWS_REGION" 
     ]
     for sec in secretos_necesarios:
         val = os.environ.get(sec)
