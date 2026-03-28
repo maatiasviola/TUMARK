@@ -160,6 +160,22 @@ sqs = boto3.client(
     region_name=settings.AWS_REGION
 )
 
+def actualizar_estado_ec2(actas_procesadas, errores):
+    # El orquestador ya inyecta esta variable en el bash
+    instance_id = os.environ.get('INSTANCE_ID') 
+    if not instance_id: 
+        return # Si estás probando en tu PC local, no hace nada
+
+    try:
+        ec2 = boto3.client('ec2', region_name='us-east-2')
+        estado = f"Procesadas: {actas_procesadas} | Errores: {errores}"
+        ec2.create_tags(
+            Resources=[instance_id],
+            Tags=[{'Key': 'EstadoWorker', 'Value': estado}]
+        )
+    except Exception as e:
+        pass # Ignoramos errores silenciosamente para no frenar la ingesta
+
 async def watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, tasks_activas):
     """Monitorea signos vitales y detecta cuellos de botella en tiempo real."""
     while True:
@@ -540,6 +556,20 @@ async def worker_sqs():
                                 Entries=entries
                             )
                             print(f"✅ Guardado y borrado lote de {len(lote)} actas.")
+                            
+                            total_procesadas_worker = metricas.lotes_db * MAX_LOTE
+                            
+                            # Actualizamos cada 300 actas (30 lotes de 10)
+                            if total_procesadas_worker > 0 and total_procesadas_worker % 300 == 0:
+                                # Ejecutamos en thread para no bloquear el loop de asyncio
+                                asyncio.create_task(
+                                    asyncio.to_thread(
+                                        actualizar_estado_ec2, 
+                                        total_procesadas_worker, 
+                                        metricas.errores_red + metricas.errores_db
+                                    )
+                                )
+                        
                         except Exception as e:
                             # DB ya tiene los datos. ON CONFLICT garantiza
                             # idempotencia si SQS reencola estos mensajes.

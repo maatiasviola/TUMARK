@@ -53,6 +53,20 @@ FASES = {
         "chunks": [("2024-01-01", "2024-01-31")],
         "n_workers": 3,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "0.5", "DELAY_MAX": "1.5"},
+    },
+    "fase_anual": {
+        "chunks": [
+            ("2023-01-01", "2023-03-31"), # Q1
+            ("2023-04-01", "2023-06-30"), # Q2
+            ("2023-07-01", "2023-09-30"), # Q3
+            ("2023-10-01", "2023-12-31")  # Q4
+        ],
+        "n_workers": 5,
+        "env": {
+            "CONCURRENCIA": "3", 
+            "DELAY_MIN": "0.5", 
+            "DELAY_MAX": "1.5"
+        },
     }
 }
 
@@ -135,7 +149,8 @@ su - ubuntu -c '
     git pull origin main
     source venv/bin/activate
     pip install -r requirements.txt
-    python3 src/pipelines/worker_extractor.py
+    export PYTHONUNBUFFERED=1
+    python3 -u src/pipelines/worker_extractor.py
 '
 """
 
@@ -209,6 +224,8 @@ def _obtener_tags_workers(instancias_ids: list) -> dict:
     except Exception as e:
         print(f"Error leyendo tags: {e}")
     return estados
+
+
 
 def monitorear(total_inicial=None, instancias_ids=None, intervalo_s=60):
     print(f"\n{'='*60}\n  MONITOR (actualiza cada {intervalo_s}s — Ctrl+C para salir)\n{'='*60}\n")
