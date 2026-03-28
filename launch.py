@@ -88,65 +88,35 @@ MONITOR_STALL_CYCLES      = 4     # ciclos con throughput=0 → worker zombie (a
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_user_data(fase: str, worker_label: str) -> str:
     """
-    Genera el script de user_data del worker.
-
-    Cambios críticos:
-    - 'sudo -u ubuntu bash -c ...' en lugar de 'su - ubuntu -c ...'
-      El guion en 'su -' hace login shell limpio, destruyendo las variables
-      del entorno padre (incluyendo INSTANCE_ID que se capturó previamente).
-      'sudo -u ubuntu' sin '-i' hereda el entorno del proceso llamador.
-    - Las variables del worker se escriben en /etc/worker.env y el servicio
-      systemd las inyecta con EnvironmentFile, evitando todo problema de escaping.
-    - El worker se registra como servicio systemd con Restart=on-failure:
-      si crashea o lo matan, systemd lo levanta automáticamente.
-    - Un watchdog bash independiente detecta freeze (log sin actividad por
-      WORKER_FREEZE_TIMEOUT_S segundos) y reinicia el servicio.
-    - La instancia se apaga sola al terminar la cola, sin costo residual.
+    Genera el script de user_data inyectando los secretos del Orquestador.
     """
+    # 1. Cargamos la configuración básica de la fase
     worker_env = FASES[fase]["env"].copy()
-    
-    # 2. Inyectamos los secretos del Orquestador hacia los Workers
-    secretos_necesarios = [
+
+    # 2. Lista de secretos que DEBEN viajar del Orquestador al Worker
+    secretos = [
         "DB_URI", "DATABASE_URL", "SQS_QUEUE_URL", 
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", 
-        "SUPABASE_URL", "SUPABASE_KEY", "AWS_REGION" 
+        "AWS_REGION", "SUPABASE_URL", "SUPABASE_KEY"
     ]
-    for sec in secretos_necesarios:
-        val = os.environ.get(sec)
-        if val:
-            worker_env[sec] = val
 
+    for s in secretos:
+        valor = os.getenv(s)
+        if valor:
+            worker_env[s] = valor
+
+    # Construir el cuerpo del archivo .env para el worker
     env_file_body = "\n".join(f'{k}="{v}"' for k, v in worker_env.items())
 
-
-    # Nota: {{ y }} son llaves literales de bash dentro del f-string.
-    # {AWS_REGION}, {fase}, {worker_label}, {env_file_body}, {WORKER_FREEZE_TIMEOUT_S}
-    # son expansiones de Python.
+    # 3. Retornamos el script de Bash con el puente de variables
     return f"""#!/bin/bash
 set -euo pipefail
 exec > >(tee -a /var/log/worker.log | logger -t worker -s 2>/dev/console) 2>&1
 echo "=== USER DATA INIT $(date -u +%Y-%m-%dT%H:%M:%SZ)  label={worker_label}  fase={fase} ==="
 
-# ── IMDSv2 — obtener Instance ID ────────────────────────────────────────────
-TOKEN=$(curl -sf --retry 5 --retry-delay 3 \\
-    -X PUT "http://169.254.169.254/latest/api/token" \\
-    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-INSTANCE_ID=$(curl -sf --retry 5 --retry-delay 3 \\
-    -H "X-aws-ec2-metadata-token: $TOKEN" \\
-    http://169.254.169.254/latest/meta-data/instance-id)
-echo "INSTANCE_ID=$INSTANCE_ID"
+TOKEN=$(curl -sf --retry 5 --retry-delay 3 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -sf --retry 5 --retry-delay 3 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 
-# ── Helper: etiquetar la instancia desde dentro ──────────────────────────────
-tag_worker() {{
-    aws ec2 create-tags --region {AWS_REGION} --resources "$INSTANCE_ID" \\
-        --tags "Key=EstadoWorker,Value=$1" 2>/dev/null || true
-}}
-
-tag_worker "Bootstrap"
-
-# ── Escribir entorno en /etc/worker.env ─────────────────────────────────────
-# INSTANCE_ID no se conoce en el momento de generar el script (Python),
-# por eso se inyecta aquí en runtime, una vez recuperada de IMDS.
 cat > /etc/worker.env << 'ENVEOF'
 AWS_DEFAULT_REGION={AWS_REGION}
 PYTHONUNBUFFERED=1
@@ -155,34 +125,24 @@ PYTHONDONTWRITEBYTECODE=1
 ENVEOF
 echo "INSTANCE_ID=$INSTANCE_ID" >> /etc/worker.env
 chmod 640 /etc/worker.env
-echo "✅ /etc/worker.env escrito"
 
-# ── Preparar código ──────────────────────────────────────────────────────────
+tag_worker() {{
+    aws ec2 create-tags --region {AWS_REGION} --resources "$INSTANCE_ID" --tags "Key=EstadoWorker,Value=$1" 2>/dev/null || true
+}}
+
 tag_worker "Preparando código"
-# CRÍTICO: usar 'sudo -u ubuntu' (NO 'su - ubuntu') para no limpiar el entorno.
-# El EnvironmentFile ya provee todo lo que necesita el proceso; este bloque
-# solo actualiza el código y las dependencias.
 sudo -u ubuntu bash -c "
     set -euo pipefail
     cd /home/ubuntu/TUMARK
-    echo '--- git pull ---'
     git pull origin main
-    echo '--- activating venv ---'
     source venv/bin/activate
-    echo '--- pip install ---'
-    pip install -q -r requirements.txt 2>&1 | tail -5
-    echo '✅ Código y dependencias OK'
+    pip install -q -r requirements.txt
 " || {{ tag_worker "ERROR_SETUP"; shutdown -h now; exit 1; }}
 
-# ── Instalar el worker como servicio systemd ────────────────────────────────
-# Restart=on-failure: si el proceso muere por cualquier causa (crash, OOM,
-# excepción no capturada), systemd lo reinicia automáticamente.
-# RestartBurstLimit: máximo 5 reinicios antes de considerarlo inestable.
 cat > /etc/systemd/system/worker-extractor.service << SVCEOF
 [Unit]
-Description=INPI Worker Extractor  fase={fase}  {worker_label}
+Description=INPI Worker Extractor
 After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -193,9 +153,6 @@ EnvironmentFile=/etc/worker.env
 ExecStart=/home/ubuntu/TUMARK/venv/bin/python3 -u src/pipelines/worker_extractor.py
 Restart=on-failure
 RestartSec=15
-RestartBurstLimit=5
-TimeoutStartSec=180
-TimeoutStopSec=60
 StandardOutput=append:/var/log/worker.log
 StandardError=append:/var/log/worker.log
 
@@ -207,65 +164,34 @@ systemctl daemon-reload
 systemctl enable worker-extractor.service
 systemctl start worker-extractor.service
 tag_worker "Servicio iniciado"
-echo "=== SYSTEMD SERVICE STARTED $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
-# ── Watchdog: detectar freeze por silencio en el log ────────────────────────
-# Problema observado: el event loop asyncio puede quedar en CPU spin (100% CPU)
-# sin escribir al log y sin morir — systemd no lo detecta porque el proceso sigue vivo.
-# Este watchdog reinicia el servicio si el log lleva más de FREEZE_TIMEOUT segundos
-# sin actividad.
+# Watchdog corregido para f-strings
 FREEZE_TIMEOUT={WORKER_FREEZE_TIMEOUT_S}
-cat > /usr/local/bin/worker-watchdog.sh << 'WDEOF'
+cat > /usr/local/bin/worker-watchdog.sh << WDEOF
 #!/bin/bash
 LOG=/var/log/worker.log
-FREEZE_TIMEOUT=FREEZE_TIMEOUT_PLACEHOLDER
+FREEZE_TIMEOUT=$FREEZE_TIMEOUT
 SVC=worker-extractor.service
-
-echo "WATCHDOG started (freeze_timeout=${{FREEZE_TIMEOUT}}s)" >> /var/log/watchdog.log
-
 while true; do
     sleep 60
-
-    # Solo actuar si el servicio está activo
-    if ! systemctl is-active --quiet "$SVC"; then
-        continue
-    fi
-
-    if [ ! -f "$LOG" ]; then
-        continue
-    fi
-
-    LOG_AGE=$(( $(date +%s) - $(stat -c %Y "$LOG") ))
-
-    if [ "$LOG_AGE" -gt "$FREEZE_TIMEOUT" ]; then
-        echo "$(date -u) WATCHDOG: log sin actividad por ${{LOG_AGE}}s (límite ${{FREEZE_TIMEOUT}}s) — reiniciando $SVC" >> /var/log/watchdog.log
-        systemctl restart "$SVC"
+    if ! systemctl is-active --quiet "\\$SVC"; then continue; fi
+    LOG_AGE=\\$(( \\$(date +%s) - \\$(stat -c %Y "\\$LOG") ))
+    if [ "\\$LOG_AGE" -gt "\\$FREEZE_TIMEOUT" ]; then
+        echo "\\$(date) WATCHDOG: Restarting \\$SVC" >> /var/log/watchdog.log
+        systemctl restart "\\$SVC"
     fi
 done
 WDEOF
-
-# Sustituir el placeholder con el valor real
-sed -i "s/FREEZE_TIMEOUT_PLACEHOLDER/$FREEZE_TIMEOUT/" /usr/local/bin/worker-watchdog.sh
 chmod +x /usr/local/bin/worker-watchdog.sh
 nohup /usr/local/bin/worker-watchdog.sh >> /var/log/watchdog.log 2>&1 &
-echo "✅ Watchdog iniciado (PID $!)"
 
-# ── Esperar a que el worker termine y apagarse ──────────────────────────────
-# Cuando la cola se vacía, el worker_extractor debe salir con código 0.
-# Si agota los reinicios de systemd, el servicio queda en 'failed'.
-# En ambos casos, terminamos la instancia para no acumular costos.
 while true; do
     sleep 30
     ST=$(systemctl is-active worker-extractor.service 2>/dev/null || echo "unknown")
-    case "$ST" in
-        inactive|failed)
-            EXIT_CODE=$(systemctl show worker-extractor.service -p ExecMainStatus --value 2>/dev/null || echo "?")
-            tag_worker "Completado exit=$EXIT_CODE"
-            echo "=== WORKER DONE status=$ST exit=$EXIT_CODE $(date -u) ==="
-            shutdown -h now
-            break
-            ;;
-    esac
+    if [[ "$ST" == "inactive" || "$ST" == "failed" ]]; then
+        shutdown -h now
+        break
+    fi
 done
 """
 
