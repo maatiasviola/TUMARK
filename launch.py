@@ -208,7 +208,7 @@ LOG=/var/log/worker.log
 FREEZE_TIMEOUT=FREEZE_TIMEOUT_PLACEHOLDER
 SVC=worker-extractor.service
 
-echo "WATCHDOG started (freeze_timeout=${FREEZE_TIMEOUT}s)" >> /var/log/watchdog.log
+echo "WATCHDOG started (freeze_timeout=${{FREEZE_TIMEOUT}}s)" >> /var/log/watchdog.log
 
 while true; do
     sleep 60
@@ -225,7 +225,7 @@ while true; do
     LOG_AGE=$(( $(date +%s) - $(stat -c %Y "$LOG") ))
 
     if [ "$LOG_AGE" -gt "$FREEZE_TIMEOUT" ]; then
-        echo "$(date -u) WATCHDOG: log sin actividad por ${LOG_AGE}s (límite ${FREEZE_TIMEOUT}s) — reiniciando $SVC" >> /var/log/watchdog.log
+        echo "$(date -u) WATCHDOG: log sin actividad por ${{LOG_AGE}}s (límite ${{FREEZE_TIMEOUT}}s) — reiniciando $SVC" >> /var/log/watchdog.log
         systemctl restart "$SVC"
     fi
 done
