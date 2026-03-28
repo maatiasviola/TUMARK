@@ -103,8 +103,21 @@ def _build_user_data(fase: str, worker_label: str) -> str:
       WORKER_FREEZE_TIMEOUT_S segundos) y reinicia el servicio.
     - La instancia se apaga sola al terminar la cola, sin costo residual.
     """
-    worker_env    = FASES[fase]["env"]
+    worker_env = FASES[fase]["env"].copy()
+    
+    # 2. Inyectamos los secretos del Orquestador hacia los Workers
+    secretos_necesarios = [
+        "DB_URI", "DATABASE_URL", "SQS_QUEUE_URL", 
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", 
+        "SUPABASE_URL", "SUPABASE_KEY"
+    ]
+    for sec in secretos_necesarios:
+        val = os.environ.get(sec)
+        if val:
+            worker_env[sec] = val
+
     env_file_body = "\n".join(f'{k}="{v}"' for k, v in worker_env.items())
+
 
     # Nota: {{ y }} son llaves literales de bash dentro del f-string.
     # {AWS_REGION}, {fase}, {worker_label}, {env_file_body}, {WORKER_FREEZE_TIMEOUT_S}
