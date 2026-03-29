@@ -1,35 +1,30 @@
 """
-inpi_marcas.py
+inpi_marcas.py — Cliente HTTP del INPI.
 
-Cliente HTTP para el portal del INPI.
+ARQUITECTURA DE DOS FASES
+─────────────────────────
+  obtener_html_detalle()      → Fase 1: descarga HTML del acta (async)
+  obtener_texto_vista_async() → Fase 2: descarga texto de vista (async)
+                                Usa el MISMO sem_inpi que las actas.
+                                Concurrencia total (actas + vistas) <= CONCURRENCIA.
 
-Métodos async  → usados por el worker (aiohttp, event loop).
-Métodos sync   → usados por el parser desde threads de executor_parser.
-
-HILO DE SEGURIDAD EN _sync_session:
-  requests.Session no muta su estado interno durante llamadas GET/POST
-  read-only (request(), send() y resolve_redirects() no escriben a self.*).
-  El pool de conexiones de urllib3 usa su propio mecanismo interno de
-  sincronización. Por lo tanto, compartir una Session entre threads para
-  operaciones de solo lectura es seguro en la práctica.
-
-  El beneficio de tener una sola Session compartida vs una por thread es que
-  todos los threads comparten el MISMO pool de conexiones (pool_maxsize=100),
-  maximizando el reuso de sockets TCP y reduciendo handshakes SSL simultáneos
-  contra el INPI.
+SIN SESIÓN SÍNCRONA
+────────────────────
+  La _sync_session con pool de 100 conexiones fue eliminada.
+  Era la causa raíz de los SSL EOF: conexiones stale en el pool
+  cerradas por el INPI sin que urllib3 lo supiera.
+  Todo el I/O al INPI ahora pasa por aiohttp con sem_inpi como governor.
 """
 
-import aiohttp
-import asyncio
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from src.db.metricas_ingesta import metricas
 import time
+import asyncio
+import aiohttp
+from src.db.metricas_ingesta import metricas
 
 URL_GRILLA_MARCAS = "https://portaltramites.inpi.gob.ar/MarcasConsultas/GrillaMarcasAvanzada"
 URL_DETALLE_MARCA = "https://portaltramites.inpi.gob.ar/MarcasConsultas/Resultado"
 URL_DETALLE_VISTA = "https://portaltramites.inpi.gob.ar/MarcasConsultas/ObtenerVistaTexto"
+BASE_URL          = "https://portaltramites.inpi.gob.ar"
 
 HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
@@ -40,41 +35,8 @@ HEADERS = {
     )
 }
 
-# ── Sesión síncrona con Connection Pooling ────────────────────────────────────
-#
-# Sin Session: cada llamada a obtener_texto_vista() hace
-#   TCP connect → TLS handshake (200–400ms) → GET → TCP close
-#
-# Con Session: el socket se reutiliza por keep-alive
-#   TCP connect → TLS handshake → GET → GET → GET → ...
-#
-# Con 80 threads de parser y actas de 10 vistas cada una,
-# esto elimina ~800 handshakes SSL por ciclo.
-#
-# pool_connections=1: un solo host destino (portaltramites.inpi.gob.ar).
-# pool_maxsize=100:   slots de conexión; debe ser >= PARSER_WORKERS (80).
-#
-# Retry para errores de servidor: reintenta automáticamente antes de
-# llegar al caller. backoff_factor=1 → 0s, 1s, 2s entre intentos.
-# raise_on_status=False: dejamos que raise_for_status() en el caller decida.
+HTML_MIN_BYTES = 500  # body más pequeño → rate limit silencioso del INPI
 
-_retry_policy = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[500, 502, 503, 504],
-    raise_on_status=False,
-)
-_adapter = HTTPAdapter(
-    max_retries=_retry_policy,
-    pool_connections=1,
-    pool_maxsize=100,
-)
-_sync_session = requests.Session()
-_sync_session.mount("https://", _adapter)
-_sync_session.mount("http://",  _adapter)
-
-
-# ── Métodos asíncronos (worker) ───────────────────────────────────────────────
 
 async def obtener_lista_actas(session, payload):
     """[ASYNC] Obtiene la lista de IDs de actas desde la grilla."""
@@ -86,8 +48,7 @@ async def obtener_lista_actas(session, payload):
                 data  = await response.json()
                 filas = data.get("rows", [])
                 return [f['Acta'] for f in filas if f.get('Acta')]
-            else:
-                print(f"⚠️ Grilla Status {response.status}")
+            print(f"⚠️ Grilla Status {response.status}")
     except Exception as e:
         print(f"❌ Error Async Grilla: {e}")
     return []
@@ -95,13 +56,13 @@ async def obtener_lista_actas(session, payload):
 
 async def obtener_html_detalle(session, nro_acta, proxy=None):
     """
-    [ASYNC] Obtiene el HTML del detalle de una marca.
+    [ASYNC] Fase 1: descarga el HTML del detalle de un acta.
 
-    Devuelve el HTML como string, o None si hay error.
-    NO llama a metricas.registrar_error(): el caller (extraer_y_encolar)
-    es el único que tiene contexto del intento actual y registra el error
-    con el valor correcto de 'reintento'. Si lo registráramos aquí también,
-    cada fallo de red contaría doble en las métricas.
+    Valida que el body sea suficientemente grande. Una respuesta
+    < HTML_MIN_BYTES es rate limiting silencioso del INPI (HTTP 200 vacío).
+
+    NO registra metricas.registrar_error(): el caller (extraer_y_encolar)
+    tiene contexto del número de intento y es el único que debe registrar.
     """
     t0      = time.time()
     payload = {"acta": nro_acta}
@@ -113,40 +74,60 @@ async def obtener_html_detalle(session, nro_acta, proxy=None):
             proxy=proxy,
             timeout=30
         ) as response:
-            if response.status == 200:
-                html = await response.text()
-                metricas.registrar_html(html, time.time() - t0, response.status)
-                return html
-            else:
+            if response.status != 200:
+                print(f"⚠️ [HTTP {response.status}] INPI para acta {nro_acta}.")
+                return None
+            html = await response.text()
+            if not html or len(html) < HTML_MIN_BYTES:
                 print(
-                    f"⚠️ [HTTP {response.status}] "
-                    f"Error del servidor INPI para acta {nro_acta}."
+                    f"⚠️ [Acta {nro_acta}] Body pequeño "
+                    f"({len(html) if html else 0} bytes) — rate limit. Forzando reintento."
                 )
                 return None
+            metricas.registrar_html(html, time.time() - t0, response.status)
+            return html
     except Exception:
-        # No registramos métricas aquí. Ver docstring.
         return None
 
 
-# ── Métodos sincrónicos (executor_parser threads) ─────────────────────────────
-
-def obtener_texto_vista(id_vista):
+async def obtener_texto_vista_async(
+    session:    aiohttp.ClientSession,
+    cod_vista:  str,
+    sem_inpi:   asyncio.Semaphore,
+) -> str:
     """
-    [SYNC] Obtiene el texto de una vista reutilizando la conexión TCP.
+    [ASYNC] Fase 2: descarga el texto de una vista.
 
-    Usa _sync_session para evitar un TLS handshake por cada vista.
-    El Retry configurado maneja errores 5xx transitorios del INPI
-    automáticamente antes de llegar al caller.
+    USA EL MISMO sem_inpi QUE LAS ACTAS.
+    Esto es la garantía central del sistema: la concurrencia total
+    contra el INPI (actas + vistas) nunca supera CONCURRENCIA,
+    independientemente de cuántos workers o cuántas vistas por acta.
 
-    Si falla definitivamente, propaga la excepción hacia arriba.
-    El worker la atrapa, aborta el acta completa y SQS la reencola.
-    Esto garantiza que ninguna acta se guarda con vistas parciales.
+    POR QUÉ EL DELAY VA ANTES DEL SEMÁFORO:
+      Si el sleep estuviera dentro del 'async with sem_inpi', el semáforo
+      quedaría ocupado durante la espera, bloqueando otras coroutines.
+      Afuera del semáforo, el sleep es puramente cosmético (rate suavizado)
+      y no consume un slot de concurrencia.
+
+    POLÍTICA DE FALLOS:
+      Si falla, propaga la excepción. El caller (extraer_y_encolar)
+      decide si reprocesar el acta completa. No hay dato parcial silencioso.
     """
-    res = _sync_session.get(
-        URL_DETALLE_VISTA,
-        headers=HEADERS,
-        params={"Cod_VistaExp": id_vista},
-        timeout=15.0
-    )
-    res.raise_for_status()
-    return res.text
+    # Delay antes del semáforo — no ocupa slot de concurrencia
+    await asyncio.sleep(0.3)
+
+    async with sem_inpi:
+        async with session.get(
+            URL_DETALLE_VISTA,
+            headers={k: v for k, v in HEADERS.items() if k != "Content-Type"},
+            params={"Cod_VistaExp": cod_vista},
+            timeout=aiohttp.ClientTimeout(total=15.0),
+        ) as response:
+            if response.status != 200:
+                raise aiohttp.ClientResponseError(
+                    response.request_info, response.history, status=response.status
+                )
+            texto = await response.text()
+            if not texto or len(texto) < 10:
+                raise ValueError(f"Vista {cod_vista}: respuesta vacía.")
+            return texto

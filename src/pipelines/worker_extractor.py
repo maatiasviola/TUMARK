@@ -223,46 +223,24 @@ async def extraer_y_encolar(
     cola_resultados,
     executor_parser,
 ):
-    """
-    Extrae un acta del INPI, la parsea y deposita el resultado en la cola interna.
-
-    CONTRATO:
-      - SIEMPRE libera sem_tareas en el finally, sin excepciones.
-        Si no lo hiciera, cada bug silencioso dreanaría el semáforo
-        y el productor se bloquearía para siempre en acquire().
-      - Nunca bloquea indefinidamente: cada I/O tiene timeout propio.
-      - Si falla MAX_INTENTOS veces: no pone nada en la cola.
-        SQS reencola el mensaje al vencer el visibility timeout.
-    """
     loop = asyncio.get_running_loop()
-
+ 
     try:
         await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-
+ 
         for intento in range(1, MAX_INTENTOS + 1):
             try:
-                # ── 1. HTTP al INPI ───────────────────────────────────────
+                # ── Fase 1a: HTTP al INPI — HTML del acta ────────────────────
                 async with sem_inpi:
                     html = await asyncio.wait_for(
-                        inpi_marcas.obtener_html_detalle(
-                            session, nro_acta#, proxy=PROXY_URL
-                        ),
+                        inpi_marcas.obtener_html_detalle(session, nro_acta),
                         timeout=25.0
                     )
-
+ 
                 if not html:
                     raise ValueError(f"HTML vacío o error HTTP para acta {nro_acta}")
-
-                # ── 2. Parser en executor_parser ──────────────────────────
-                # CRÍTICO: loop.run_in_executor(executor_parser, ...) en vez
-                # de asyncio.to_thread() (que usaría executor_io, el default).
-                # Los zombie threads de timeouts deben quedar confinados en
-                # executor_parser. Un zombie en executor_io bloquearía DB/SQS.
-                #
-                # BUG CORREGIDO: la versión anterior tenía un except interno
-                # que llamaba a metricas.registrar_error() y luego re-lanzaba.
-                # El except externo también lo llama. Resultado: doble registro
-                # por cada timeout de parser. Ahora solo re-lanzamos sin registrar.
+ 
+                # ── Fase 1b: Parser en executor_parser (CPU-bound, sin HTTP) ──
                 try:
                     datos = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -275,18 +253,67 @@ async def extraer_y_encolar(
                     )
                 except asyncio.TimeoutError:
                     print(
-                        f"💀 TIMEOUT PARSER: Acta {nro_acta} "
-                        f"tardó >{PARSER_TIMEOUT_S}s. "
+                        f"💀 TIMEOUT PARSER: Acta {nro_acta} tardó >{PARSER_TIMEOUT_S}s. "
                         f"Thread zombie aislado en executor_parser. "
                         f"(intento {intento}/{MAX_INTENTOS})"
                     )
-                    raise  # el except externo lo registra y hace el backoff
-
+                    raise
+ 
                 if not datos:
                     print(f"⚠️ Parser devolvió None para acta {nro_acta}. SQS reintentará.")
                     return
-
-                # ── 3. Imagen en executor_parser ──────────────────────────
+ 
+                # ── Fase 2: Descargar textos de vistas (async + sem_inpi) ─────
+                #
+                # Cada vista tiene '_cod_vista' inyectado por el parser.
+                # Disparamos todas en paralelo con gather; cada coroutine
+                # espera su slot en sem_inpi antes de hablar con el INPI.
+                # Concurrencia total (actas + vistas) siempre <= CONCURRENCIA.
+                #
+                # return_exceptions=True: gather NO cancela las demás vistas
+                # si una falla. Recolectamos todos los resultados y luego
+                # verificamos si alguno es excepción.
+                #
+                # POLÍTICA: 1 vista fallida = reprocesar acta completa.
+                # Justificación: dato parcial en vistas es inaceptable para
+                # una ingesta histórica de referencia. Los errores transitorios
+                # (red, timeout) se recuperan en el siguiente intento del acta.
+                # Los permanentes (URL rota del INPI) son < 0.1% y se resuelven
+                # con el visibility timeout de SQS.
+                vistas = datos.get("vistas", [])
+                cods   = [v.get("_cod_vista") for v in vistas]
+ 
+                if any(cods):
+                    tareas = [
+                        inpi_marcas.obtener_texto_vista_async(session, cod, sem_inpi)
+                        if cod else asyncio.coroutine(lambda: None)()
+                        for cod in cods
+                    ]
+                    textos = await asyncio.gather(*tareas, return_exceptions=True)
+ 
+                    # Verificar si alguna vista falló
+                    errores = [
+                        (i, r) for i, r in enumerate(textos)
+                        if isinstance(r, Exception)
+                    ]
+                    if errores:
+                        idx, exc = errores[0]
+                        cod_fallido = cods[idx]
+                        print(
+                            f"⚠️ Vista {cod_fallido} falló en acta {nro_acta} "
+                            f"(intento {intento}/{MAX_INTENTOS}): {type(exc).__name__}: {exc}"
+                        )
+                        raise exc  # dispara el loop de reintentos del acta
+ 
+                    # Enriquecer vistas con nro_oposicion_vinculada (en RAM, sin I/O)
+                    textos_limpios = [t if isinstance(t, str) else None for t in textos]
+                    html_parser.enriquecer_vistas_con_textos(vistas, textos_limpios, nro_acta)
+ 
+                # Limpiar campo interno antes de pasar al consumidor
+                for v in vistas:
+                    v.pop("_cod_vista", None)
+ 
+                # ── Imagen en executor_parser ─────────────────────────────────
                 if datos.get("url_imagen"):
                     try:
                         id_img, hash_img = await asyncio.wait_for(
@@ -300,52 +327,42 @@ async def extraer_y_encolar(
                         datos["id_imagen"]   = id_img
                         datos["hash_imagen"] = hash_img
                     except asyncio.TimeoutError:
-                        print(
-                            f"⚠️ Timeout descargando imagen "
-                            f"para acta {nro_acta}. Continuando sin imagen."
-                        )
+                        print(f"⚠️ Timeout imagen para acta {nro_acta}. Continuando sin imagen.")
                         datos["id_imagen"]   = None
                         datos["hash_imagen"] = None
                 else:
                     datos["id_imagen"]   = None
                     datos["hash_imagen"] = None
-
-                # ── 4. Depositar en la cola interna ───────────────────────
+ 
+                # ── Depositar en cola interna ─────────────────────────────────
                 await cola_resultados.put({
                     "datos":  datos,
                     "handle": receipt_handle,
                     "nro":    nro_acta
                 })
                 return  # éxito
-
+ 
             except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as e:
                 print(
                     f"⌛ Timeout/Red en acta {nro_acta} "
                     f"(intento {intento}/{MAX_INTENTOS}): {type(e).__name__}"
                 )
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
-
+ 
             except Exception as e:
-                print(
-                    f"⚠️ Error acta {nro_acta} "
-                    f"(intento {intento}/{MAX_INTENTOS}): {e}"
-                )
+                print(f"⚠️ Error acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {e}")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
-
+ 
             if intento < MAX_INTENTOS:
                 backoff = (2 ** intento) + random.uniform(0, 1)
                 await asyncio.sleep(backoff)
-
+ 
         print(
             f"❌ Acta {nro_acta} agotó {MAX_INTENTOS} intentos. "
             f"SQS repondrá el mensaje al vencer el visibility timeout."
         )
-
+ 
     finally:
-        # Este finally es el corazón del sistema de backpressure.
-        # Se ejecuta SIEMPRE: éxito, fallo, timeout, CancelledError.
-        # Sin él, cada excepción no prevista drenraría sem_tareas hasta
-        # que el productor se bloqueara para siempre en acquire().
         sem_tareas.release()
 
 
