@@ -338,55 +338,9 @@ def sembrar(nombre_fase: str, esperar_fin: bool = True) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. LEVANTAR
 # ─────────────────────────────────────────────────────────────────────────────
-def _verificar_arranque(ids: list[str], timeout_s: int = WORKER_BOOT_TIMEOUT_S) -> dict[str, bool]:
-    """
-    Espera hasta timeout_s a que cada worker reporte un EstadoWorker
-    diferente de los estados iniciales ('Iniciando...', 'Bootstrap', 'Preparando código').
-    Retorna {iid: True si arrancó correctamente, False si hubo timeout o terminó mal}.
-    """
-    ESTADOS_PENDIENTE = {"Iniciando...", "Bootstrap", "Preparando código"}
-    pendientes        = set(ids)
-    resultado         = {iid: False for iid in ids}
-    deadline          = time.time() + timeout_s
-
-    print(f"\n  Verificando arranque de {len(pendientes)} workers "
-          f"(timeout {timeout_s // 60} min)...")
-
-    while pendientes and time.time() < deadline:
-        time.sleep(WORKER_BOOT_POLL_S)
-        workers = _describe_workers(list(pendientes))
-
-        for iid in list(pendientes):
-            info = workers.get(iid, {})
-            estado_ec2 = info.get("estado_ec2", "unknown")
-            tag_estado = info.get("tag_estado", "Sin estado")
-
-            # Si la instancia terminó inesperadamente antes de arrancar
-            if estado_ec2 in ("terminated", "shutting-down", "stopped"):
-                print(f"  ❌  {iid[-8:]} terminó antes de arrancar ({estado_ec2})")
-                pendientes.discard(iid)
-                continue
-
-            # Si ya reportó un estado que no es "iniciando"
-            if tag_estado not in ESTADOS_PENDIENTE:
-                if "ERROR" in tag_estado.upper():
-                    print(f"  ❌  {iid[-8:]} reportó error: {tag_estado}")
-                else:
-                    print(f"  ✅  {iid[-8:]} arrancó: {tag_estado}")
-                    resultado[iid] = True
-                pendientes.discard(iid)
-
-    if pendientes:
-        print(
-            f"\n  ⚠️  Timeout — {len(pendientes)} worker(s) no reportaron inicio en "
-            f"{timeout_s // 60} min: {[i[-8:] for i in pendientes]}"
-        )
-        print("     Posibles causas: AMI lenta, git pull largo, pip install pesado.")
-        print("     Revisá /var/log/worker.log en cada instancia.")
-
-    return resultado
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. LEVANTAR
+# ─────────────────────────────────────────────────────────────────────────────
 def levantar(nombre_fase: str) -> list[str]:
     cfg = FASES.get(nombre_fase)
     if not cfg:
@@ -418,18 +372,7 @@ def levantar(nombre_fase: str) -> list[str]:
     fname = f"instancias_{nombre_fase}.json"
     with open(fname, "w") as f:
         json.dump(instancias, f, indent=2)
-    print(f"\n  IDs guardados en {fname}")
-
-    # Verificar que arrancaron
-    resultado = _verificar_arranque(instancias)
-    fallidos  = [iid for iid, ok in resultado.items() if not ok]
-
-    if fallidos:
-        print(f"\n  ⚠️  {len(fallidos)} worker(s) no arrancaron correctamente.")
-        print("     Podés reemplazarlos manualmente con: python launch.py levantar "
-              f"{nombre_fase} --reemplazar {' '.join(fallidos)}")
-    else:
-        print(f"\n  ✅  Todos los workers reportaron inicio correctamente.")
+    print(f"\n  ✅ IDs guardados en {fname}. Las instancias están booteando en AWS.")
 
     return instancias
 
@@ -453,16 +396,26 @@ def monitorear(
     prev_proc    = None
     prev_t       = None
     total_ref    = total_inicial
-    stall_cycles = 0    # ciclos consecutivos con throughput ≈ 0
+    stall_cycles = 0
     reemplazos_realizados = 0        
     MAX_REEMPLAZOS_PERMITIDOS = 5
-
+    
+    # Estados donde sabemos que el worker aún está instalando cosas
+    ESTADOS_BOOT = {"Iniciando...", "Bootstrap", "Preparando código", "Sin estado"}
     tiempo_inicio_monitor = time.time()
+
     try:
         while True:
             t_ahora = time.time()
 
-            # ── Leer cola SQS ──────────────────────────────────────────────
+            # ── 1. Evaluar estado físico de las máquinas (Prioridad 1) ────────
+            workers_info = _describe_workers(ids_activos) if ids_activos else {}
+            workers_booteando = any(
+                info.get("tag_estado", "Sin estado") in ESTADOS_BOOT 
+                for info in workers_info.values()
+            )
+
+            # ── 2. Leer cola SQS ──────────────────────────────────────────────
             try:
                 visibles, en_vuelo = contar_mensajes()
             except Exception as e:
@@ -472,14 +425,19 @@ def monitorear(
 
             restantes = visibles + en_vuelo
 
-            if total_ref is None:
+            # ── 3. Lógica de inicio de ingesta (Soporta delay de booteo) ──────
+            if total_ref is None or total_ref == 0:
                 total_ref = restantes
                 if total_ref == 0:
-                    print("  Cola vacía desde el inicio.")
-                    break
-                print(f"  Total estimado (primer reading): {total_ref:,}\n")
+                    if workers_booteando:
+                        print("  ⏳ [BOOTING] Workers inicializando dependencias. SQS vacía por ahora...")
+                    elif ids_activos:
+                        print("  ⏳ Workers listos, esperando que el sembrador envíe actas a SQS...")
+                    else:
+                        print("  ✅ Cola vacía y sin workers activos. Saliendo.")
+                        break
 
-            procesadas = max(0, total_ref - restantes)
+            procesadas = max(0, total_ref - restantes) if total_ref > 0 else 0
             pct        = procesadas / total_ref * 100 if total_ref > 0 else 0
 
             if prev_proc is not None and prev_t is not None:
@@ -500,51 +458,46 @@ def monitorear(
 
             print(f"  [{ahora}]  [{barra}]  {pct:5.1f}%")
             
-            # ---  TIEMPO ---
             tiempo_transcurrido = time.time() - tiempo_inicio_monitor
             str_transcurrido = str(timedelta(seconds=int(tiempo_transcurrido)))
             print(f"   Tiempo total: {str_transcurrido}")
-            # ------------------------------------
             
             print(f"   Procesadas  : {procesadas:>9,}  / {total_ref:,}")
             print(f"   En cola     : {visibles:>9,}")
+            print(f"   En vuelo    : {en_vuelo:>9,}")
             print(f"   Throughput  : {tput:>9.1f}  actas/s")
             print(f"   ETA         : {eta_str}")
 
-            # ── Estado de workers y auto-healing ──────────────────────────
+            # ── 4. Estado de workers y auto-healing ──────────────────────────
             if ids_activos:
-                workers = _describe_workers(ids_activos)
                 print("   Workers     :")
-
                 muertos = []
                 for iid in ids_activos:
-                    info       = workers.get(iid, {})
+                    info       = workers_info.get(iid, {})
                     estado_ec2 = info.get("estado_ec2", "unknown")
                     tag_estado = info.get("tag_estado", "Sin estado")
 
                     icono = "🟢" if estado_ec2 == "running" else "🔴"
-                    print(f"      {icono}  {iid[-8:]}  EC2={estado_ec2}  Worker={tag_estado}")
+                    # UI clara: si está booteando le ponemos un relojito
+                    tag_visual = f"⏳ {tag_estado}" if tag_estado in ESTADOS_BOOT else tag_estado
+                    print(f"      {icono}  {iid[-8:]}  EC2={estado_ec2:12} Worker={tag_visual}")
 
                     if estado_ec2 in ("terminated", "shutting-down", "stopped"):
                         muertos.append(iid)
 
-                # Reemplazar workers muertos (spot interruption, crash fatal, etc.)
+                # Reemplazar workers muertos
                 for iid_muerto in muertos:
                     if nombre_fase and restantes > 0:
                         if reemplazos_realizados < MAX_REEMPLAZOS_PERMITIDOS:
                             print(f"\n  🔄  {iid_muerto[-8:]} terminó — lanzando reemplazo ({reemplazos_realizados + 1}/{MAX_REEMPLAZOS_PERMITIDOS})...")
                             idx_nuevo = len(ids_activos) + 1
-                            nuevo_iid = _lanzar_una_instancia(
-                                nombre_fase,
-                                f"reemplazo-{idx_nuevo:02d}",
-                            )
+                            nuevo_iid = _lanzar_una_instancia(nombre_fase, f"reemplazo-{idx_nuevo:02d}")
                             
                             ids_activos.remove(iid_muerto)
                             if nuevo_iid:
                                 ids_activos.append(nuevo_iid)
-                                reemplazos_realizados += 1  # Solo sumamos si AWS realmente nos dio la máquina
+                                reemplazos_realizados += 1
                                 
-                                # Actualizar el JSON de instancias
                                 fname = f"instancias_{nombre_fase}.json"
                                 try:
                                     with open(fname) as f:
@@ -555,30 +508,25 @@ def monitorear(
                                 except Exception:
                                     pass
                         else:
-                            # Límite alcanzado: Degradación Elegante.
                             if iid_muerto in ids_activos:
                                 ids_activos.remove(iid_muerto)
-                            print(f"\n  🚨  ALERTA: {iid_muerto[-8:]} murió. Límite de {MAX_REEMPLAZOS_PERMITIDOS} reemplazos agotado.")
-                            print(f"  ⚠️  Continuando la ingesta solo con los {len(ids_activos)} workers sobrevivientes.")
+                            print(f"\n  🚨  ALERTA: Límite de {MAX_REEMPLAZOS_PERMITIDOS} reemplazos agotado.")
                     else:
                         if iid_muerto in ids_activos:
                             ids_activos.remove(iid_muerto)
-                        
 
-            # ── Detectar stall global ──────────────────────────────────────
-            if tput < 0.01 and restantes > 0 and prev_proc is not None:
+            # ── 5. Detectar stall global ──────────────────────────────────────
+            if tput < 0.01 and restantes > 0 and prev_proc is not None and not workers_booteando:
                 stall_cycles += 1
                 if stall_cycles >= MONITOR_STALL_CYCLES:
-                    print(
-                        f"\n  ⚠️  ALERTA: {stall_cycles} ciclos consecutivos sin progreso. "
-                        f"Revisá los workers — puede haber un freeze en el event loop asyncio."
-                    )
+                    print(f"\n  ⚠️  ALERTA: {stall_cycles} ciclos consecutivos sin progreso. Revisá workers.")
             else:
                 stall_cycles = 0
 
             print()
 
-            if restantes == 0:
+            # Condición de salida limpia
+            if restantes == 0 and total_ref > 0 and not workers_booteando:
                 print(f"  ✅  Cola vacía. Ingesta completada — {procesadas:,} actas.")
                 break
 
@@ -633,10 +581,10 @@ def main():
     elif args.cmd == "levantar":
         ids = levantar(args.fase)
         if not args.sin_monitor:
-            print("\n  Esperando 30s adicionales antes de iniciar el monitor...\n")
-            time.sleep(30)
+            print("\n  Iniciando monitor en tiempo real...\n")
             monitorear(nombre_fase=args.fase, total_inicial=args.total, instancias=ids)
 
+    # ¡ESTE BLOQUE TE FALTABA! Es el que te permite reconectarte al monitor si cerrás la terminal
     elif args.cmd == "monitorear":
         ids_file = args.instancias or (f"instancias_{args.fase}.json" if args.fase else None)
         ids: list[str] = []
@@ -655,20 +603,14 @@ def main():
         )
 
     elif args.cmd == "todo":
-        # Sembradores en background
         procs_sembradores = sembrar(args.fase, esperar_fin=False)
 
-        print("\n  Esperando 20s para que SQS reciba los primeros mensajes...")
-        time.sleep(20)
+        print("\n  Esperando 10s para que AWS registre las peticiones iniciales...")
+        time.sleep(10)
 
         ids = levantar(args.fase)
-
-        print("\n  Esperando 30s adicionales antes de iniciar el monitor...\n")
-        time.sleep(30)
-
         monitorear(nombre_fase=args.fase, total_inicial=args.total, instancias=ids)
 
-        # Asegurarse de que los sembradores terminaron
         for p in procs_sembradores:
             p.wait()
 
