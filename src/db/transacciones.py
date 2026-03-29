@@ -368,6 +368,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
                 map_acta_nro_opo_idopo[(r[0], r[1])] = r[2]
 
         vistas_dict = {}
+        
         for datos in lista_datos_procesados:
             id_a = map_nroacta_idacta.get(datos['nro_acta'])
             if id_a:
@@ -387,6 +388,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
                         v.get('Fecha_Contestacion')
                     )
 
+        vistas_para_insertar = []
         if vistas_dict:
             # Ordenamos para evitar deadlocks (Bug C)
             vistas_para_insertar = sorted(vistas_dict.values(), key=lambda r: (r[0], r[1] or 0, r[2] or 0))
@@ -428,7 +430,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
         print(
             f"🚀 LOTE OK: {len(actas_dict)} actas · "
             f"{len(oposiciones_dict)} oposiciones · "
-            f"{len(vistas_para_insertar)} vistas · "
+            f"{len(vistas_dict)} vistas · "
             f"{len(actas_subitems_para_insertar)} productos vinculados"
         )
         return True
