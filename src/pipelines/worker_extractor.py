@@ -558,7 +558,7 @@ async def worker_sqs():
             lote         = []
             handles      = []
             MAX_LOTE     = 10      # límite duro de AWS delete_message_batch
-            MAX_ESPERA   = 5.0
+            MAX_ESPERA   = 15.0
             backoff_err  = 1.0
 
             while True:
