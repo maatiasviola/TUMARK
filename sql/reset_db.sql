@@ -72,10 +72,15 @@ CREATE INDEX ON marcas_imagenes USING hnsw (embedding vector_cosine_ops);
 
 CREATE TABLE titulares (
     id_titular SERIAL PRIMARY KEY,
-    nombre TEXT UNIQUE, 
-    cuit_cuil BIGINT UNIQUE, 
+    identidad_hash TEXT UNIQUE NOT NULL, -- Clave MDM Híbrida (Hash de CUIT o Nombre)
+    cuit_cuil BIGINT,                    -- Ya NO es UNIQUE
+    nombre TEXT NOT NULL,                -- Ya NO es UNIQUE
     pais TEXT
 );
+
+-- Índices recomendados para búsquedas analíticas posteriores
+CREATE INDEX idx_titulares_cuit ON titulares (cuit_cuil) WHERE cuit_cuil IS NOT NULL;
+CREATE INDEX idx_titulares_nombre ON titulares (nombre);
 
 CREATE TABLE marcas (
     id_marca SERIAL PRIMARY KEY,
@@ -139,7 +144,8 @@ CREATE TABLE vistas (
     id_oposicion INT REFERENCES oposiciones(id_oposicion), 
     fecha DATE,
     fecha_contestacion DATE, 
-    fecha_vencimiento DATE
+    fecha_vencimiento DATE,
+    CONSTRAINT uq_vistas_acta UNIQUE NULLS NOT DISTINCT (id_acta, id_tipo_vista, id_oposicion, fecha)
 );
 
 -- ==========================================

@@ -167,7 +167,8 @@ def actualizar_estado_ec2(actas_procesadas, errores):
         return # Si estás probando en tu PC local, no hace nada
 
     try:
-        ec2 = boto3.client('ec2', region_name='us-east-2')
+        region = os.environ.get('AWS_DEFAULT_REGION', settings.AWS_REGION)
+        ec2 = boto3.client('ec2', region_name=region)
         estado = f"Procesadas: {actas_procesadas} | Errores: {errores}"
         ec2.create_tags(
             Resources=[instance_id],

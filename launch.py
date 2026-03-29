@@ -457,6 +457,7 @@ def monitorear(
     reemplazos_realizados = 0        
     MAX_REEMPLAZOS_PERMITIDOS = 5
 
+    tiempo_inicio_monitor = time.time()
     try:
         while True:
             t_ahora = time.time()
@@ -498,9 +499,15 @@ def monitorear(
             ahora = datetime.now().strftime("%H:%M:%S")
 
             print(f"  [{ahora}]  [{barra}]  {pct:5.1f}%")
+            
+            # ---  TIEMPO ---
+            tiempo_transcurrido = time.time() - tiempo_inicio_monitor
+            str_transcurrido = str(timedelta(seconds=int(tiempo_transcurrido)))
+            print(f"   Tiempo total: {str_transcurrido}")
+            # ------------------------------------
+            
             print(f"   Procesadas  : {procesadas:>9,}  / {total_ref:,}")
             print(f"   En cola     : {visibles:>9,}")
-            print(f"   En vuelo    : {en_vuelo:>9,}")
             print(f"   Throughput  : {tput:>9.1f}  actas/s")
             print(f"   ETA         : {eta_str}")
 
