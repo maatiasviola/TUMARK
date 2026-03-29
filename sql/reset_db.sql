@@ -191,3 +191,24 @@ CREATE TABLE resultados_busquedas (
     score INT,
     PRIMARY KEY (id_busqueda, id_marca)
 );
+
+-- ==========================================
+-- 6. CONFIGURACIÓN DE SEGURIDAD (Backend Ingesta)
+-- ==========================================
+-- Apagamos RLS para permitir la inserción masiva desde los Workers
+ALTER TABLE dim_clases_niza DISABLE ROW LEVEL SECURITY;
+ALTER TABLE dim_subitems_clases_niza DISABLE ROW LEVEL SECURITY;
+ALTER TABLE dim_tipo_marca DISABLE ROW LEVEL SECURITY;
+ALTER TABLE dim_estado_tramite_acta DISABLE ROW LEVEL SECURITY;
+ALTER TABLE dim_tipos_vistas DISABLE ROW LEVEL SECURITY;
+ALTER TABLE dim_tipo_busqueda DISABLE ROW LEVEL SECURITY;
+
+ALTER TABLE marcas_imagenes DISABLE ROW LEVEL SECURITY;
+ALTER TABLE titulares DISABLE ROW LEVEL SECURITY;
+ALTER TABLE marcas DISABLE ROW LEVEL SECURITY;
+ALTER TABLE actas DISABLE ROW LEVEL SECURITY;
+ALTER TABLE actas_subitems_desnormalizados DISABLE ROW LEVEL SECURITY;
+ALTER TABLE actas_subitems DISABLE ROW LEVEL SECURITY;
+ALTER TABLE actas_titulares DISABLE ROW LEVEL SECURITY;
+ALTER TABLE oposiciones DISABLE ROW LEVEL SECURITY;
+ALTER TABLE vistas DISABLE ROW LEVEL SECURITY;
