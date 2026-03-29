@@ -68,7 +68,7 @@ FASES = {
             ("2023-10-01", "2023-12-31"),
         ],
         "n_workers": 10,
-        "env":       {"CONCURRENCIA": "3", "DELAY_MIN": "0.3", "DELAY_MAX": "1.2"},
+        "env":       {"CONCURRENCIA": "4", "DELAY_MIN": "0.3", "DELAY_MAX": "1.2"},
     },
 }
 

@@ -142,7 +142,7 @@ async def obtener_texto_vista_async(
       decide si reprocesar el acta completa. No hay dato parcial silencioso.
     """
     # Delay antes del semáforo — no ocupa slot de concurrencia
-    await asyncio.sleep(0.3)
+    #await asyncio.sleep(0.05)
 
     async with sem_inpi:
         async with session.get(
