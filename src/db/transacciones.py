@@ -1,46 +1,33 @@
 """
 transacciones.py — Versión definitiva con Identidad Híbrida (MDM)
 
-═══════════════════════════════════════════════════════════════
-BUGS CORREGIDOS RESPECTO A LA VERSIÓN ANTERIOR
-═══════════════════════════════════════════════════════════════
-
-  Bug A (v1) — "duplicate key value violates unique constraint titulares_nombre_key"
-  Bug A (v2) — "duplicate key value violates unique constraint titulares_cuit_cuil_key"
-  ──────────────────────────────────────────────────────────────────────────────────
-  CAUSA RAÍZ ESTRUCTURAL: La tabla titulares tenía DOS restricciones UNIQUE
-  independientes: (cuit_cuil) y (nombre). Con datos sucios del INPI es imposible
-  manejar UPSERT masivos con un único ON CONFLICT:
-
-    - ON CONFLICT (nombre) → un titular con mismo CUIT pero nombre con typo
-      intenta insertar una fila nueva → explota en UNIQUE (cuit_cuil).
-    - ON CONFLICT (cuit_cuil) → un titular extranjero sin CUIT (NIKE) con
-      nombre levemente distinto intenta insertar → explota en UNIQUE (nombre).
-
-  No hay ninguna cláusula SQL que maneje simultáneamente dos restricciones
-  UNIQUE independientes en un INSERT masivo.
-
-  FIX DEFINITIVO (Patrón MDM — Identidad Híbrida):
-    - Eliminar ambas restricciones UNIQUE.
-    - Agregar columna identidad_hash con UNIQUE constraint único.
-    - Hash = md5("CUIT:<cuit>") si tiene CUIT → inmune a typos de nombre.
-    - Hash = md5("NOMBRE:<nombre>") si no tiene CUIT → extranjerors como NIKE.
-    - ON CONFLICT (identidad_hash) DO UPDATE → un único handler, siempre funciona.
-    - REQUIERE ejecutar migracion_titulares.sql en Supabase antes de deployar.
+BUGS CORREGIDOS
+═══════════════
+  Bug A — duplicate key en titulares (dos UNIQUE independientes)
+    FIX: Identidad Híbrida. Una sola columna identidad_hash con UNIQUE.
+         md5("CUIT:<cuit>") si tiene CUIT, md5("NOMBRE:<nombre>") si no.
+         ON CONFLICT (identidad_hash) → un único handler, siempre funciona.
+         PREREQUISITO: schema.sql con la nueva definición de titulares.
 
   Bug B — "ON CONFLICT DO UPDATE command cannot affect row a second time"
-  ────────────────────────────────────────────────────────────────────────
-  SQS puede re-entregar el mismo nro_acta en el mismo batch. Un INSERT con
-  ON CONFLICT DO UPDATE no puede afectar la misma fila dos veces en un comando.
-  FIX: Deduplicación temprana por nro_acta al inicio de _ejecutar_lote.
-  Igual para oposiciones (nro_acta, nro_oposicion) y actas_titulares (nro_acta, id_titular).
+    FIX: Deduplicación temprana por nro_acta. Igual para oposiciones y
+         actas_titulares con dicts keyed por PK compuesta.
 
   Bug C — "deadlock detected"
-  ────────────────────────────
-  Múltiples workers adquieren locks de filas en distinto orden → ciclo → deadlock.
-  FIX (doble capa):
-    1. Todos los INSERTs van ordenados por su clave → mismo orden de lock en todos los workers.
-    2. Retry automático ante DeadlockDetected con backoff aleatorio (hasta 3 intentos).
+    FIX (doble capa):
+      1. Todos los INSERTs ordenados ASC por clave → mismo orden de lock.
+      2. Retry ante DeadlockDetected con backoff aleatorio (3 intentos).
+
+  Bug D — "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+    CAUSA: vistas tiene CONSTRAINT uq_vistas_acta UNIQUE NULLS NOT DISTINCT
+           sobre (id_acta, id_tipo_vista, id_oposicion, fecha).
+           PostgreSQL NO puede inferir automáticamente un constraint con
+           NULLS NOT DISTINCT al usar ON CONFLICT (columnas).
+           id_oposicion es nullable → sin NULLS NOT DISTINCT, dos vistas con
+           id_oposicion=NULL serían distintas → no habría conflicto detectable.
+    FIX: ON CONFLICT ON CONSTRAINT uq_vistas_acta (nombre explícito).
+         Adicionalmente, deduplicación en RAM con dict keyed por la misma
+         tupla que define el constraint, para no llegar duplicados al INSERT.
 """
 
 from .conexion import get_supabase
@@ -65,19 +52,13 @@ _MAX_DEADLOCK_RETRIES = 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IDENTIDAD HÍBRIDA — debe ser idéntica a la del SQL de migración
+# IDENTIDAD HÍBRIDA
+# Debe ser byte-a-byte idéntica al CASE WHEN del schema.sql
 # ─────────────────────────────────────────────────────────────────────────────
 def calcular_hash_titular(cuit: int | None, nombre: str) -> str:
     """
-    Identidad híbrida para titulares:
-      - Con CUIT: la identidad es el CUIT. Dos actas del mismo CUIT con nombres
-        con typos distintos ("COCA COLA S.A." vs "COCA-COLA SA") se mapean
-        al mismo hash → mismo registro en DB.
-      - Sin CUIT: la identidad es el nombre normalizado. Extranjeros como NIKE,
-        ADIDAS, etc. que nunca tendrán CUIT argentino.
-
-    CRÍTICO: Este cálculo debe ser byte-a-byte idéntico al UPDATE del SQL de
-    migración (migracion_titulares.sql). Si los cambiás, cambiá ambos.
+    Con CUIT  → md5("CUIT:<cuit>")    — inmune a typos de nombre.
+    Sin CUIT  → md5("NOMBRE:<nombre>") — para extranjeros sin CUIT argentino.
     """
     if cuit:
         return hashlib.md5(f"CUIT:{cuit}".encode()).hexdigest()
@@ -85,30 +66,28 @@ def calcular_hash_titular(cuit: int | None, nombre: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INICIALIZACIÓN
+# INICIALIZACIÓN DE CACHÉ
 # ─────────────────────────────────────────────────────────────────────────────
 def inicializar_cache_desde_db():
-    """Carga dimensiones y TODOS los productos Niza en memoria RAM."""
     conn = get_pg_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id_tipo_marca, tipo_marca FROM dim_tipo_marca")
-            cache_dimensiones["dim_tipo_marca"] = {row[1].upper(): row[0] for row in cur.fetchall()}
+            cache_dimensiones["dim_tipo_marca"] = {r[1].upper(): r[0] for r in cur.fetchall()}
 
             cur.execute("SELECT id_estado_tramite, estado_tramite FROM dim_estado_tramite_acta")
-            cache_dimensiones["dim_estado_tramite_acta"] = {row[1].upper(): row[0] for row in cur.fetchall()}
+            cache_dimensiones["dim_estado_tramite_acta"] = {r[1].upper(): r[0] for r in cur.fetchall()}
 
             cur.execute("SELECT id_tipo_vista, tipo_vista FROM dim_tipos_vistas")
-            cache_dimensiones["dim_tipos_vistas"] = {row[1].upper(): row[0] for row in cur.fetchall()}
+            cache_dimensiones["dim_tipos_vistas"] = {r[1].upper(): r[0] for r in cur.fetchall()}
 
             cur.execute("SELECT id_clase, id_subitem, subitem FROM dim_subitems_clases_niza")
-            for row in cur.fetchall():
-                id_clase, id_subitem, subitem = row
-                if id_clase not in cache_dimensiones["dim_subitems_niza"]:
-                    cache_dimensiones["dim_subitems_niza"][id_clase] = []
-                cache_dimensiones["dim_subitems_niza"][id_clase].append((id_subitem, subitem.upper()))
+            for id_clase, id_subitem, subitem in cur.fetchall():
+                cache_dimensiones["dim_subitems_niza"].setdefault(id_clase, []).append(
+                    (id_subitem, subitem.upper())
+                )
 
-        print(f"🧠 Caché sincronizada: Dimensiones listas. {len(cache_dimensiones['dim_subitems_niza'])} Clases Niza cacheadas en RAM.")
+        print(f"🧠 Caché sincronizada: {len(cache_dimensiones['dim_subitems_niza'])} Clases Niza cacheadas en RAM.")
     finally:
         conn.close()
 
@@ -129,7 +108,7 @@ def obtener_id_dimension(tabla, col_desc, valor_raw, nro_acta=None):
         return cache_dimensiones[tabla][valor_limpio]
 
     acta_info = f" (Origen: Acta {nro_acta})" if nro_acta else ""
-    print(f"✨ Valor nuevo en {tabla}: '{valor_limpio}'{acta_info}. Registrando HTTP...")
+    print(f"✨ Valor nuevo en {tabla}: '{valor_limpio}'{acta_info}. Registrando...")
 
     sb  = get_supabase()
     res = sb.table(tabla).upsert({col_desc: valor_limpio}, on_conflict=col_desc).execute()
@@ -142,11 +121,11 @@ def obtener_id_dimension(tabla, col_desc, valor_raw, nro_acta=None):
 
 
 def _pre_resolver_dimensiones_lote(lista_datos_raw):
-    for datos_raw in lista_datos_raw:
-        obtener_id_dimension("dim_tipo_marca", "tipo_marca", datos_raw.get('tipo_marca_texto'), datos_raw.get('nro_acta'))
-        obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos_raw.get('estado_tramite'), datos_raw.get('nro_acta'))
-        for v in datos_raw.get('vistas', []):
-            obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'), datos_raw.get('nro_acta'))
+    for d in lista_datos_raw:
+        obtener_id_dimension("dim_tipo_marca",          "tipo_marca",    d.get('tipo_marca_texto'), d.get('nro_acta'))
+        obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", d.get('estado_tramite'),   d.get('nro_acta'))
+        for v in d.get('vistas', []):
+            obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'), d.get('nro_acta'))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,57 +164,39 @@ def guardar_lote_tramites_completo(lista_datos_raw):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EJECUCIÓN DEL LOTE — separado para poder reintentar limpiamente
+# EJECUCIÓN DEL LOTE
 # ─────────────────────────────────────────────────────────────────────────────
 def _ejecutar_lote(conn, lista_datos_raw):
     with conn.cursor() as cur:
 
         # ── FASE 1: Limpieza ──────────────────────────────────────────────────
-        lista_datos_procesados = [limpiar_datos_para_db(d) for d in lista_datos_raw]
+        lista = [limpiar_datos_para_db(d) for d in lista_datos_raw]
 
-        # ── DEDUPLICACIÓN TEMPRANA (Bug B) ────────────────────────────────────
-        # SQS puede re-entregar el mismo nro_acta en el mismo batch.
-        # ON CONFLICT DO UPDATE no puede afectar la misma fila dos veces
-        # en un único comando → error fatal.
+        # ── DEDUPLICACIÓN POR nro_acta (Bug B) ───────────────────────────────
+        # SQS puede re-entregar el mismo mensaje en el mismo batch.
+        # ON CONFLICT DO UPDATE no puede afectar la misma fila dos veces.
         dedup = {}
-        for d in lista_datos_procesados:
+        for d in lista:
             dedup[d['nro_acta']] = d
-        lista_datos_procesados = list(dedup.values())
+        lista = list(dedup.values())
 
-        # ── FASE 2: Titulares con Identidad Híbrida (MDM) ─────────────────────
-        #
-        # PROBLEMA RESUELTO: La tabla antes tenía UNIQUE(cuit_cuil) y UNIQUE(nombre)
-        # como restricciones independientes. Cualquier UPSERT masivo fallaba porque
-        # ON CONFLICT solo puede apuntar a UNA restricción a la vez:
-        #   - "COCA COLA S.A." y "COCA-COLA SA" tienen el mismo CUIT pero distinto
-        #     nombre → ON CONFLICT(nombre) inserta nueva fila → explota en UNIQUE(cuit).
-        #   - NIKE llega dos veces con nombre con typo → ON CONFLICT(cuit) no aplica
-        #     (no tiene CUIT) → explota en UNIQUE(nombre).
-        #
-        # SOLUCIÓN: Columna identidad_hash con ÚNICA restricción UNIQUE.
-        #   - Con CUIT: hash = md5("CUIT:<cuit>") → inmune a typos de nombre.
-        #   - Sin CUIT: hash = md5("NOMBRE:<nombre>") → cubre extranjeros.
-        #   - ON CONFLICT (identidad_hash) → siempre hay exactamente un handler.
-        #
-        # PREREQUISITO: Ejecutar migracion_titulares.sql en Supabase.
-        #
-        # ORDEN ASC por identidad_hash (Bug C — deadlock):
-        # Todos los workers insertan en el mismo orden → imposible ciclo de locks.
-
-        titulares_unificados = {}  # identidad_hash → (identidad_hash, cuit, nombre, pais)
-        for datos in lista_datos_procesados:
+        # ── FASE 2: Titulares con Identidad Híbrida (Bug A) ───────────────────
+        titulares_unificados = {}   # identidad_hash → (hash, cuit, nombre, pais)
+        for datos in lista:
             for t in datos.get('titulares', []):
                 cuit   = int(t['cuit_cuil']) if t.get('cuit_cuil') else None
                 nombre = t.get('nombre', 'DESCONOCIDO').strip().upper()
                 pais   = t.get('pais', 'ARGENTINA').upper()
-
-                ih = calcular_hash_titular(cuit, nombre)
+                ih     = calcular_hash_titular(cuit, nombre)
                 if ih not in titulares_unificados:
+                    titulares_unificados[ih] = (ih, cuit, nombre, pais)
+                elif cuit and not titulares_unificados[ih][1]:
+                    # Enriquecer con cuit si la entrada previa no lo tenía
                     titulares_unificados[ih] = (ih, cuit, nombre, pais)
 
         map_hash_idtitular = {}
         if titulares_unificados:
-            titulares_para_insertar = sorted(titulares_unificados.values(), key=lambda r: r[0])
+            rows = sorted(titulares_unificados.values(), key=lambda r: r[0])
             execute_values(cur, """
                 INSERT INTO titulares (identidad_hash, cuit_cuil, nombre, pais) VALUES %s
                 ON CONFLICT (identidad_hash) DO UPDATE SET
@@ -243,47 +204,39 @@ def _ejecutar_lote(conn, lista_datos_raw):
                     cuit_cuil = COALESCE(titulares.cuit_cuil, EXCLUDED.cuit_cuil),
                     pais      = EXCLUDED.pais
                 RETURNING identidad_hash, id_titular;
-            """, titulares_para_insertar)
+            """, rows)
             for r in cur.fetchall():
                 map_hash_idtitular[r[0]] = r[1]
 
-        # ── FASE 3: Enriquecimiento de Marcas ──────────────────────────────────
-        # El lookup ahora usa identidad_hash para encontrar el id_titular correcto.
+        # ── FASE 3: Marcas ────────────────────────────────────────────────────
         marcas_para_insertar = {}
         titulares_a_vincular = []
 
-        for datos in lista_datos_procesados:
-            ids_titulares_acta = []
+        for datos in lista:
+            ids_tit = []
             for t in datos.get('titulares', []):
                 cuit   = int(t['cuit_cuil']) if t.get('cuit_cuil') else None
                 nombre = t.get('nombre', 'DESCONOCIDO').strip().upper()
-                ih     = calcular_hash_titular(cuit, nombre)
+                id_t   = map_hash_idtitular.get(calcular_hash_titular(cuit, nombre))
+                if id_t:
+                    ids_tit.append(id_t)
+                    titulares_a_vincular.append((datos['nro_acta'], id_t, t.get('porcentaje', 100.0)))
 
-                id_titular = map_hash_idtitular.get(ih)
-                if id_titular:
-                    ids_titulares_acta.append(id_titular)
-                    titulares_a_vincular.append((datos['nro_acta'], id_titular, t.get('porcentaje', 100.0)))
-
-            ids_titulares_sorted = sorted(set(ids_titulares_acta))
-            id_tipo   = obtener_id_dimension("dim_tipo_marca",          "tipo_marca",     datos.get('tipo_marca_texto'))
+            ids_tit_sorted = sorted(set(ids_tit))
+            id_tipo   = obtener_id_dimension("dim_tipo_marca",          "tipo_marca",    datos.get('tipo_marca_texto'))
             id_estado = obtener_id_dimension("dim_estado_tramite_acta", "estado_tramite", datos.get('estado_tramite'))
+            ih_marca  = calcular_identidad_marca(datos.get('denominacion'), id_tipo, datos.get('hash_imagen'), ids_tit_sorted)
 
-            identidad_hash = calcular_identidad_marca(
-                datos.get('denominacion'), id_tipo, datos.get('hash_imagen'), ids_titulares_sorted
-            )
-
-            if identidad_hash not in marcas_para_insertar:
-                marcas_para_insertar[identidad_hash] = (
-                    datos.get('denominacion'), ids_titulares_sorted,
-                    datos.get('id_imagen'), id_tipo, identidad_hash
+            if ih_marca not in marcas_para_insertar:
+                marcas_para_insertar[ih_marca] = (
+                    datos.get('denominacion'), ids_tit_sorted, datos.get('id_imagen'), id_tipo, ih_marca
                 )
-
-            datos['_identidad_hash'] = identidad_hash
-            datos['_id_tipo']        = id_tipo
-            datos['_id_estado']      = id_estado
+            datos['_ih_marca'] = ih_marca
+            datos['_id_tipo']  = id_tipo
+            datos['_id_estado'] = id_estado
 
         # ── FASE 4: Bulk Marcas ────────────────────────────────────────────────
-        map_hash_idmarca = {}
+        map_ihmarca_idmarca = {}
         if marcas_para_insertar:
             execute_values(cur, """
                 INSERT INTO marcas (denominacion, ids_titulares, id_imagen, id_tipo_marca, identidad_hash)
@@ -293,27 +246,30 @@ def _ejecutar_lote(conn, lista_datos_raw):
                 RETURNING identidad_hash, id_marca;
             """, sorted(marcas_para_insertar.values(), key=lambda r: r[4]))
             for r in cur.fetchall():
-                map_hash_idmarca[r[0]] = r[1]
+                map_ihmarca_idmarca[r[0]] = r[1]
 
         # ── FASE 5: Bulk Actas ─────────────────────────────────────────────────
         actas_dict = {}
-        for datos in lista_datos_procesados:
-            id_m    = map_hash_idmarca.get(datos['_identidad_hash'])
+        for datos in lista:
             nro_res = int(datos['nro_resolucion']) if datos.get('nro_resolucion') and str(datos['nro_resolucion']).isdigit() else None
             actas_dict[datos['nro_acta']] = (
-                datos['nro_acta'], id_m, datos.get('id_clase'), datos['_id_estado'],
-                datos.get('id_imagen'), datos['_id_tipo'], datos.get('denominacion'),
-                datos.get('fecha_ingreso'), datos.get('fecha_vencimiento'),
-                nro_res, datos.get('fecha_disposicion'), datos.get('es_clase_completa')
+                datos['nro_acta'],
+                map_ihmarca_idmarca.get(datos['_ih_marca']),
+                datos.get('id_clase'),      datos['_id_estado'],
+                datos.get('id_imagen'),     datos['_id_tipo'],
+                datos.get('denominacion'),  datos.get('fecha_ingreso'),
+                datos.get('fecha_vencimiento'), nro_res,
+                datos.get('fecha_disposicion'), datos.get('es_clase_completa')
             )
 
         map_nroacta_idacta = {}
         if actas_dict:
             execute_values(cur, """
-                INSERT INTO actas (nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen,
-                                   id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento,
-                                   nro_resolucion, fecha_disposicion, es_clase_completa)
-                VALUES %s
+                INSERT INTO actas (
+                    nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen,
+                    id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento,
+                    nro_resolucion, fecha_disposicion, es_clase_completa
+                ) VALUES %s
                 ON CONFLICT (nro_acta) DO UPDATE SET
                     id_estado_tramite = EXCLUDED.id_estado_tramite,
                     id_marca          = EXCLUDED.id_marca,
@@ -326,112 +282,124 @@ def _ejecutar_lote(conn, lista_datos_raw):
             for r in cur.fetchall():
                 map_nroacta_idacta[r[0]] = r[1]
 
-        # ── FASE 6: Bulk Actas_Titulares ───────────────────────────────────────
-        actas_titulares_dict = {}
-        for nro_acta, id_titular, porcentaje in titulares_a_vincular:
+        # ── FASE 6: Actas_Titulares ────────────────────────────────────────────
+        at_dict = {}
+        for nro_acta, id_t, pct in titulares_a_vincular:
             id_a = map_nroacta_idacta.get(nro_acta)
             if id_a:
-                actas_titulares_dict[(id_a, id_titular)] = (id_a, id_titular, porcentaje)
+                at_dict[(id_a, id_t)] = (id_a, id_t, pct)
 
-        if actas_titulares_dict:
+        if at_dict:
             execute_values(cur,
                 """INSERT INTO actas_titulares (id_acta, id_titular, porcentaje) VALUES %s
                    ON CONFLICT (id_acta, id_titular) DO UPDATE SET porcentaje = EXCLUDED.porcentaje;""",
-                sorted(actas_titulares_dict.values(), key=lambda r: (r[0], r[1]))
+                sorted(at_dict.values(), key=lambda r: (r[0], r[1]))
             )
 
-        # ── FASE 7: Bulk Oposiciones y Vistas ─────────────────────────────────
-        oposiciones_dict = {}
-        for datos in lista_datos_procesados:
+        # ── FASE 7: Oposiciones ────────────────────────────────────────────────
+        opo_dict = {}
+        for datos in lista:
             id_a = map_nroacta_idacta.get(datos['nro_acta'])
             if id_a:
                 for o in datos.get('oposiciones', []):
                     key = (id_a, o.get('Numero'))
-                    oposiciones_dict[key] = (
+                    opo_dict[key] = (
                         id_a, o.get('Numero'), o.get('Oponente'),
                         o.get('Fecha_Presentacion'), o.get('Fundamento'),
                         o.get('Fecha_Levantamiento')
                     )
 
-        map_acta_nro_opo_idopo = {}
-        if oposiciones_dict:
+        map_opo = {}
+        if opo_dict:
             execute_values(cur, """
-                INSERT INTO oposiciones (id_acta, nro_oposicion, nombre_oponente,
-                                         fecha_presentacion, fundamento, fecha_levantamiento)
-                VALUES %s
-                ON CONFLICT (id_acta, nro_oposicion) DO UPDATE SET
+                INSERT INTO oposiciones (
+                    id_acta, nro_oposicion, nombre_oponente,
+                    fecha_presentacion, fundamento, fecha_levantamiento
+                ) VALUES %s
+                ON CONFLICT ON CONSTRAINT uq_oposiciones_acta_nro DO UPDATE SET
                     nombre_oponente     = EXCLUDED.nombre_oponente,
                     fecha_levantamiento = EXCLUDED.fecha_levantamiento
                 RETURNING id_acta, nro_oposicion, id_oposicion;
-            """, sorted(oposiciones_dict.values(), key=lambda r: (r[0], r[1] or 0)))
+            """, sorted(opo_dict.values(), key=lambda r: (r[0], r[1] or 0)))
             for r in cur.fetchall():
-                map_acta_nro_opo_idopo[(r[0], r[1])] = r[2]
+                map_opo[(r[0], r[1])] = r[2]
 
+        # ── FASE 8: Vistas (Bug D) ─────────────────────────────────────────────
+        #
+        # CONSTRAINT: uq_vistas_acta UNIQUE NULLS NOT DISTINCT
+        #             (id_acta, id_tipo_vista, id_oposicion, fecha)
+        #
+        # POR QUÉ ON CONFLICT ON CONSTRAINT y no ON CONFLICT (columnas):
+        # PostgreSQL no puede inferir automáticamente un constraint que usa
+        # NULLS NOT DISTINCT cuando se especifican columnas en ON CONFLICT.
+        # id_oposicion es nullable: sin NULLS NOT DISTINCT, dos vistas con
+        # id_oposicion=NULL serían consideradas distintas y se insertarían
+        # como filas separadas — duplicación silenciosa.
+        # Con NULLS NOT DISTINCT + nombre explícito del constraint, PostgreSQL
+        # trata correctamente NULL=NULL como colisión.
+        #
+        # Deduplicación en RAM: el dict usa la misma clave que el constraint.
+        # Si el INPI manda la misma vista dos veces, se pisa en RAM antes de
+        # llegar al INSERT → no hay riesgo de "affect row a second time".
         vistas_dict = {}
-        
-        for datos in lista_datos_procesados:
+        for datos in lista:
             id_a = map_nroacta_idacta.get(datos['nro_acta'])
             if id_a:
                 for v in datos.get('vistas', []):
                     id_tv   = obtener_id_dimension("dim_tipos_vistas", "tipo_vista", v.get('Tipo'))
                     opo_raw = v.get('nro_oposicion_vinculada')
-                    id_opo  = map_acta_nro_opo_idopo.get((id_a, opo_raw)) if opo_raw else None
+                    id_opo  = map_opo.get((id_a, opo_raw)) if opo_raw else None
                     fecha   = v.get('Fecha_Vista')
-                    
-                    # La tupla mapea 1 a 1 con la restricción UNIQUE de la DB
-                    clave_unica = (id_a, id_tv, id_opo, fecha)
-                    
-                    # Si el INPI manda la misma vista dos veces o SQS duplica, se pisa en RAM
-                    vistas_dict[clave_unica] = (
+
+                    # Clave idéntica a la restricción UNIQUE del schema
+                    clave = (id_a, id_tv, id_opo, fecha)
+                    vistas_dict[clave] = (
                         id_a, id_opo, id_tv, fecha,
                         v.get('Fecha_Vencimiento'),
                         v.get('Fecha_Contestacion')
                     )
 
-        vistas_para_insertar = []
         if vistas_dict:
-            # Ordenamos para evitar deadlocks (Bug C)
-            vistas_para_insertar = sorted(vistas_dict.values(), key=lambda r: (r[0], r[1] or 0, r[2] or 0))
-            
             execute_values(cur, """
                 INSERT INTO vistas (
-                    id_acta, id_oposicion, id_tipo_vista, 
+                    id_acta, id_oposicion, id_tipo_vista,
                     fecha, fecha_vencimiento, fecha_contestacion
                 ) VALUES %s
-                ON CONFLICT (id_acta, id_tipo_vista, id_oposicion, fecha) 
-                DO UPDATE SET
+                ON CONFLICT ON CONSTRAINT uq_vistas_acta DO UPDATE SET
                     fecha_vencimiento  = EXCLUDED.fecha_vencimiento,
                     fecha_contestacion = EXCLUDED.fecha_contestacion;
-            """, vistas_para_insertar)
+            """, sorted(vistas_dict.values(), key=lambda r: (r[0], r[1] or 0, r[2] or 0, str(r[3] or ''))))
 
-        # ── FASE 8: Productos en RAM pura (Cero lecturas SQL) ─────────────────
-        actas_subitems_para_insertar   = []
-        actas_subitems_desnormalizados = []
-        for datos in lista_datos_procesados:
+        # ── FASE 9: Productos en RAM pura ─────────────────────────────────────
+        subitems          = []
+        subitems_desnorm  = []
+        for datos in lista:
             id_a = map_nroacta_idacta.get(datos['nro_acta'])
             if id_a and datos.get('id_clase'):
-                vinc, desnorm = procesar_productos_ram(datos['id_clase'], datos.get('proteccion'), datos.get('limitacion'))
-                actas_subitems_para_insertar.extend([(id_a, sub) for sub in vinc])
-                actas_subitems_desnormalizados.extend([(id_a, d) for d in desnorm])
+                vinc, desnorm = procesar_productos_ram(
+                    datos['id_clase'], datos.get('proteccion'), datos.get('limitacion')
+                )
+                subitems.extend([(id_a, s) for s in vinc])
+                subitems_desnorm.extend([(id_a, d) for d in desnorm])
 
-        if actas_subitems_para_insertar:
+        if subitems:
             execute_values(cur,
                 "INSERT INTO actas_subitems (id_acta, id_subitem) VALUES %s ON CONFLICT DO NOTHING;",
-                sorted(set(actas_subitems_para_insertar), key=lambda r: (r[0], r[1]))
+                sorted(set(subitems), key=lambda r: (r[0], r[1]))
             )
 
-        if actas_subitems_desnormalizados:
+        if subitems_desnorm:
             execute_values(cur,
                 "INSERT INTO actas_subitems_desnormalizados (id_acta, subitem_desnormalizado) VALUES %s;",
-                sorted(set(actas_subitems_desnormalizados), key=lambda r: (r[0], r[1]))
+                sorted(set(subitems_desnorm), key=lambda r: (r[0], r[1]))
             )
 
         conn.commit()
         print(
             f"🚀 LOTE OK: {len(actas_dict)} actas · "
-            f"{len(oposiciones_dict)} oposiciones · "
+            f"{len(opo_dict)} oposiciones · "
             f"{len(vistas_dict)} vistas · "
-            f"{len(actas_subitems_para_insertar)} productos vinculados"
+            f"{len(subitems)} productos vinculados"
         )
         return True
 
@@ -445,50 +413,48 @@ def procesar_productos_ram(id_clase_raw, proteccion_raw, limitacion_raw):
 
     proteccion = proteccion_raw.upper().strip() if proteccion_raw else ""
     limitacion = limitacion_raw.upper().strip() if limitacion_raw else ""
-    ids_a_vincular, items_desnormalizados = set(), []
+    ids_vincular, desnorm = set(), []
 
     modo = "SOLAMENTE"
     if "TODA LA CLASE" in proteccion: modo = "TODA_LA_CLASE"
-    elif "EXCEPTO" in proteccion: modo = "EXCEPTO"
+    elif "EXCEPTO"     in proteccion: modo = "EXCEPTO"
 
     subitems_clase = cache_dimensiones.get("dim_subitems_niza", {}).get(id_clase, [])
 
     if modo in ["TODA_LA_CLASE", "EXCEPTO"]:
-        ids_a_vincular    = {sub[0] for sub in subitems_clase}
-        texto_analizar    = limitacion if modo == "TODA_LA_CLASE" else proteccion
-        texto_exclusiones = texto_analizar.split("EXCEPTO")[-1] if "EXCEPTO" in texto_analizar else (limitacion if modo == "TODA_LA_CLASE" else "")
-        items_excluir     = {x.strip().strip(".;").upper() for x in texto_exclusiones.split(';') if x.strip()}
-        if items_excluir:
-            ids_a_restar = {sub[0] for sub in subitems_clase if sub[1] in items_excluir}
-            ids_a_vincular -= ids_a_restar
+        ids_vincular       = {s[0] for s in subitems_clase}
+        texto              = limitacion if modo == "TODA_LA_CLASE" else proteccion
+        texto_exc          = texto.split("EXCEPTO")[-1] if "EXCEPTO" in texto else (limitacion if modo == "TODA_LA_CLASE" else "")
+        excluir            = {x.strip().strip(".;").upper() for x in texto_exc.split(';') if x.strip()}
+        if excluir:
+            ids_vincular  -= {s[0] for s in subitems_clase if s[1] in excluir}
     else:
-        texto_full = f"{proteccion} {limitacion}"
+        texto = f"{proteccion} {limitacion}"
         for basura in ["SOLAMENTE", "SOLO", "LIMITADA A:", "PROTEGE:", "EN CONSECUENCIA", "SE LIMITA A"]:
-            texto_full = texto_full.replace(basura, "")
-        items_texto = [x.strip().strip(".;").upper() for x in texto_full.split(';') if x.strip()]
-        if items_texto:
-            nombres_en_cache = {sub[1]: sub[0] for sub in subitems_clase}
-            for item_desc in items_texto:
-                if item_desc in nombres_en_cache:
-                    ids_a_vincular.add(nombres_en_cache[item_desc])
+            texto = texto.replace(basura, "")
+        items = [x.strip().strip(".;").upper() for x in texto.split(';') if x.strip()]
+        if items:
+            cache = {s[1]: s[0] for s in subitems_clase}
+            for item in items:
+                if item in cache:
+                    ids_vincular.add(cache[item])
                 else:
-                    items_desnormalizados.append(item_desc)
+                    desnorm.append(item)
 
-    return ids_a_vincular, items_desnormalizados
+    return ids_vincular, desnorm
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def calcular_identidad_marca(denominacion, id_tipo_marca, hash_imagen, ids_titulares):
-    denominacion_norm = denominacion.strip().upper() if denominacion else ""
-    id_tipo           = str(id_tipo_marca) if id_tipo_marca else "0"
-    hash_img_str      = str(hash_imagen) if hash_imagen else "0"
-    tits_str          = json.dumps(ids_titulares, separators=(',', ':')) if ids_titulares else "[]"
-    hash_hex          = hashlib.sha256(f"{denominacion_norm}|{id_tipo}|{hash_img_str}|{tits_str}".encode('utf-8')).hexdigest()
-    return int(hash_hex[:15], 16)
+    den    = denominacion.strip().upper() if denominacion else ""
+    tipo   = str(id_tipo_marca) if id_tipo_marca else "0"
+    img    = str(hash_imagen) if hash_imagen else "0"
+    tits   = json.dumps(ids_titulares, separators=(',', ':')) if ids_titulares else "[]"
+    return int(hashlib.sha256(f"{den}|{tipo}|{img}|{tits}".encode()).hexdigest()[:15], 16)
 
 
 def limpiar_datos_para_db(datos):
-    copia = datos.copy()
+    copia        = datos.copy()
     campos_fecha = [
         'fecha_ingreso', 'fecha_resolucion', 'fecha_vencimiento', 'fecha_disposicion',
         'fecha_vigencia', 'Fecha_Presentacion', 'Fecha_Levantamiento',
@@ -496,9 +462,7 @@ def limpiar_datos_para_db(datos):
     ]
     for k, v in copia.items():
         if isinstance(v, str):
-            if v.strip() == "":
-                copia[k] = None
-            elif k in campos_fecha and v.strip() == "00/00/0000":
+            if v.strip() == "" or (k in campos_fecha and v.strip() == "00/00/0000"):
                 copia[k] = None
     return copia
 
