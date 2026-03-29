@@ -134,7 +134,7 @@ CREATE TABLE oposiciones (
     nombre_oponente TEXT,
     fundamento TEXT,
     fecha_levantamiento DATE,
-    CONSTRAINT uq_oposiciones_acta_nro UNIQUE (id_acta, nro_oposicion)
+    CONSTRAINT uq_oposiciones_acta_nro UNIQUE NULLS NOT DISTINCT (id_acta, nro_oposicion)
 );
 
 CREATE TABLE vistas (

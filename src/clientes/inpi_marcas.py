@@ -37,9 +37,18 @@ HEADERS = {
 
 HTML_MIN_BYTES = 500  # body más pequeño → rate limit silencioso del INPI
 
+MAPEO_ESTADOS_GRILLA = {
+    "C": "Concedida",
+    "E": "En trámite",
+    "-": "En trámite",
+    "D": "Desistida",
+    "N": "Denegada",
+    "NU": "[ Nulidad Administrativa ]",
+    "CA": "Caduca Administrativa"
+}
 
 async def obtener_lista_actas(session, payload):
-    """[ASYNC] Obtiene la lista de IDs de actas desde la grilla."""
+    """[ASYNC] Obtiene actas desde la grilla con Clase y Estado ya mapeados y limpios."""
     try:
         async with session.post(
             URL_GRILLA_MARCAS, headers=HEADERS, data=payload, timeout=30
@@ -47,7 +56,26 @@ async def obtener_lista_actas(session, payload):
             if response.status == 200:
                 data  = await response.json()
                 filas = data.get("rows", [])
-                return [f['Acta'] for f in filas if f.get('Acta')]
+                
+                resultados = []
+                for f in filas:
+                    nro = f.get('Acta')
+                    if nro:
+                        # 1. Traducir Estado
+                        letra_estado = str(f.get('Estado', '')).strip().upper()
+                        estado_completo = MAPEO_ESTADOS_GRILLA.get(letra_estado, "En trámite")
+                        
+                        # 2. Limpiar Clase
+                        clase_raw = str(f.get('Clase', '')).strip()
+                        clase_limpia = int(clase_raw) if clase_raw.isdigit() else None
+
+                        # 3. Armar el diccionario limpio
+                        resultados.append({
+                            "nro_acta": int(nro),
+                            "clase_grilla": clase_limpia,
+                            "estado_grilla": estado_completo
+                        })
+                return resultados
             print(f"⚠️ Grilla Status {response.status}")
     except Exception as e:
         print(f"❌ Error Async Grilla: {e}")

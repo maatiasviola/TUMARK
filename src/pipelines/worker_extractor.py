@@ -104,6 +104,7 @@ import ssl
 import os
 import sys
 import time
+import json
 import sys as _sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -245,7 +246,7 @@ def crear_ssl_context():
 
 async def extraer_y_encolar(
     session,
-    nro_acta,
+    mensaje_body,
     receipt_handle,
     sem_inpi,
     sem_tareas,
@@ -255,6 +256,18 @@ async def extraer_y_encolar(
     loop = asyncio.get_running_loop()
  
     try:
+        # ── 0. Desempaquetar el Payload de SQS ───────────────────────────────
+        try:
+            payload = json.loads(mensaje_body)
+            nro_acta = payload.get("nro_acta")
+            clase_grilla = payload.get("clase_grilla")
+            estado_grilla = payload.get("estado_grilla")
+        except json.JSONDecodeError:
+            # Retrocompatibilidad por si quedan actas viejas como string puro
+            nro_acta = int(mensaje_body)
+            clase_grilla = None
+            estado_grilla = None
+
         await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
  
         for intento in range(1, MAX_INTENTOS + 1):
@@ -291,7 +304,22 @@ async def extraer_y_encolar(
                 if not datos:
                     print(f"⚠️ Parser devolvió None para acta {nro_acta}. SQS reintentará.")
                     return
- 
+                
+                # ── FASE 1c: MERGE (LA MAGIA DE LA GRILLA) ───────────────────
+                
+                # 1. Rellenar la Clase Niza si el Detalle del Acta vino fallado
+                id_clase_parser = datos.get("id_clase")
+                if (not id_clase_parser or str(id_clase_parser).strip() == "") and clase_grilla is not None:
+                    datos["id_clase"] = clase_grilla
+                    # Limpiamos los flags de error de Data Quality porque lo salvamos
+                    datos["requiere_revision"] = False 
+                    datos["detalle_revision"] = None
+                    print(f"  ✨ [Acta {nro_acta}] Clase salvada por la Grilla: {clase_grilla}")
+
+                # 2. Imponer el Estado de la Grilla (Es la fuente de verdad)
+                if estado_grilla:
+                    datos["_id_estado"] = estado_grilla 
+
                 # ── Fase 2: Descargar textos de vistas (async + sem_inpi) ─────
                 #
                 # Cada vista tiene '_cod_vista' inyectado por el parser.
@@ -523,7 +551,6 @@ async def worker_sqs():
                     _tasks_activas.add(task)
                     task.add_done_callback(_tasks_activas.discard)
 
-        # ─── MOTOR 2: CONSUMIDOR ──────────────────────────────────────────────
         # ─── MOTOR 2: CONSUMIDOR ──────────────────────────────────────────────
         async def consumidor():
             """
