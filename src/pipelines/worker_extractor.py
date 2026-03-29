@@ -178,27 +178,56 @@ def actualizar_estado_ec2(actas_procesadas, errores):
         pass # Ignoramos errores silenciosamente para no frenar la ingesta
 
 async def watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, tasks_activas):
-    """Monitorea signos vitales y detecta cuellos de botella en tiempo real."""
+    """Monitorea signos vitales (técnicos y de negocio) en tiempo real."""
+    tiempo_inicio = time.time()
+    
     while True:
         try:
             await asyncio.sleep(60)
             
-            # Cálculo de hilos ocupados
+            # ── 1. Métricas Técnicas (Salud de los hilos y colas) ──
             io_queue = executor_io._work_queue.qsize()
             parser_queue = executor_parser._work_queue.qsize()
+            tareas_vuelo = MAX_TAREAS_VUELO - sem_tareas._value
+            
+            # ── 2. Métricas de Negocio (Velocidad y Progreso) ──
+            tiempo_transcurrido = time.time() - tiempo_inicio
+            minutos = tiempo_transcurrido / 60.0
+            
+            # Asumimos que cada lote guardado con éxito tiene en promedio 10 actas
+            actas_exitosas = metricas.lotes_db * 10 
+            actas_error = getattr(metricas, 'actas_error', 0)
+            
+            # Velocidad real (throughput) de este worker específico
+            actas_por_minuto = actas_exitosas / minutos if minutos > 0 else 0
+            
+            # Promedio de tiempo de guardado en base de datos
+            promedio_db = (metricas.tiempo_total_db / metricas.lotes_db) if metricas.lotes_db > 0 else 0
             
             print(
-                f"📊 [WATCHDOG] Estado del Sistema:\n"
-                f"   ├─ Tareas en vuelo (semáforo): {MAX_TAREAS_VUELO - sem_tareas._value}/{MAX_TAREAS_VUELO}\n"
-                f"   ├─ Tasks de asyncio activas  : {len(tasks_activas)}\n"
-                f"   ├─ Cola resultados interna   : {cola_resultados.qsize()}/200\n"
-                f"   ├─ IO Workers encolados      : {io_queue} (Si crece, DB/SQS están lentos/colgados)\n"
-                f"   └─ Parser Workers encolados  : {parser_queue}"
+                f"\n{'='*55}\n"
+                f" 📊 [WATCHDOG] ESTADO DEL WORKER (Uptime: {minutos:.1f} min)\n"
+                f"{'='*55}\n"
+                f" 📈 NEGOCIO:\n"
+                f"   ├─ Actas Procesadas (Exitosas): {actas_exitosas:,}\n"
+                f"   ├─ Actas con Error (SQS Retry): {actas_error:,}\n"
+                f"   ├─ Velocidad Promedio         : {actas_por_minuto:.1f} actas/minuto\n"
+                f"   └─ Tiempo promedio INSERT DB  : {promedio_db:.2f}s por lote\n"
+                f"\n"
+                f" ⚙️ TÉCNICO:\n"
+                f"   ├─ Tareas en vuelo (Semáforo) : {tareas_vuelo}/{MAX_TAREAS_VUELO}\n"
+                f"   ├─ Tasks asyncio activas      : {len(tasks_activas)}\n"
+                f"   ├─ Cola resultados interna    : {cola_resultados.qsize()}/200\n"
+                f"   ├─ Parser Workers encolados   : {parser_queue}\n"
+                f"   └─ IO Workers encolados       : {io_queue}"
             )
             
             # Alarma crítica de Deadlock
             if cola_resultados.qsize() >= 200:
-                print("🚨 ALERTA: Cola de resultados LLENA. El consumidor está muerto o bloqueado.")
+                print("\n 🚨 ALERTA: Cola de resultados LLENA. El consumidor (DB/SQS) está muerto o bloqueado.")
+                
+            if io_queue > 20:
+                print("\n ⚠️ ADVERTENCIA: Muchos hilos IO encolados. La base de datos Supabase podría estar lenta.")
                 
         except asyncio.CancelledError:
             break
