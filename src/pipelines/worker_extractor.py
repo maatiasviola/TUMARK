@@ -178,7 +178,7 @@ def actualizar_estado_ec2(actas_procesadas, errores):
     except Exception as e:
         pass # Ignoramos errores silenciosamente para no frenar la ingesta
 
-async def watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, tasks_activas):
+async def watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, tasks_activas,estado_worker):
     """Monitorea signos vitales (técnicos y de negocio) en tiempo real."""
     tiempo_inicio = time.time()
     
@@ -196,13 +196,11 @@ async def watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_par
             minutos = tiempo_transcurrido / 60.0
             
             # Asumimos que cada lote guardado con éxito tiene en promedio 10 actas
-            actas_exitosas = metricas.lotes_db * 10 
+            actas_exitosas = estado_worker["procesadas"]
             actas_error = getattr(metricas, 'actas_error', 0)
             
             # Velocidad real (throughput) de este worker específico
             actas_por_minuto = actas_exitosas / minutos if minutos > 0 else 0
-            
-            # Promedio de tiempo de guardado en base de datos
             promedio_db = (metricas.tiempo_total_db / metricas.lotes_db) if metricas.lotes_db > 0 else 0
             
             print(
@@ -613,14 +611,14 @@ async def worker_sqs():
                             )
                             print(f"✅ Guardado y borrado lote de {len(lote)} actas.")
                             
-                            total_procesadas_worker = metricas.lotes_db * MAX_LOTE
+                            estado_worker["procesadas"] += len(lote)
                             
                             # Actualizamos el Tag EC2 cada 300 actas
-                            if total_procesadas_worker > 0 and total_procesadas_worker % 300 == 0:
+                            if metricas.lotes_db > 0 and metricas.lotes_db % 30 == 0:
                                 asyncio.create_task(
                                     asyncio.to_thread(
                                         actualizar_estado_ec2, 
-                                        total_procesadas_worker, 
+                                        estado_worker["procesadas"], # Pasamos el número real
                                         getattr(metricas, 'actas_error', 0)
                                     )
                                 )
@@ -644,9 +642,10 @@ async def worker_sqs():
                     backoff_err = min(backoff_err * 2, 60.0)
 
         # ─── ARRANQUE ─────────────────────────────────────────────────────────
+        estado_worker = {"procesadas": 0}
         try:
             tarea_watchdog = asyncio.create_task(
-                watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, _tasks_activas)
+                watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_parser, _tasks_activas, estado_worker)
             )
             await asyncio.gather(productor(), consumidor(), tarea_watchdog)
         finally:
