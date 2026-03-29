@@ -75,7 +75,7 @@ FASES = {
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMEOUTS Y THRESHOLDS
 # ─────────────────────────────────────────────────────────────────────────────
-LAUNCH_STAGGER_S          = 30    # segundos entre lanzamientos (era 45, suficiente con 30)
+LAUNCH_STAGGER_S          = 45    # segundos entre lanzamientos (era 45, suficiente con 30)
 WORKER_BOOT_TIMEOUT_S     = 600   # 10 min para que el worker reporte "Servicio iniciado"
 WORKER_BOOT_POLL_S        = 20    # polling durante la verificación de arranque
 WORKER_FREEZE_TIMEOUT_S   = 300   # 5 min sin output en el log del worker → watchdog reinicia
