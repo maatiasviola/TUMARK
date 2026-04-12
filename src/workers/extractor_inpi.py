@@ -97,37 +97,45 @@ class SessionManager:
     def __init__(self, concurrencia):
         self.concurrencia = concurrencia
         self.session = None
+        self._lock = asyncio.Lock()  # ← NUEVO: El candado de seguridad
 
     async def obtener_sesion(self):
-        # Si la sesión no existe o fue cerrada, creamos una nueva, limpia y fresca
-        if self.session is None or self.session.closed:
-            ssl_ctx = crear_ssl_context()
+        # Obligamos a que las tareas pasen de a una
+        async with self._lock: 
+            # Si la primera tarea ya creó la sesión, las demás saltan este if
+            if self.session is None or self.session.closed:
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
 
-            connector = aiohttp.TCPConnector(
-                ssl=ssl_ctx,
-                limit=self.concurrencia,
-                enable_cleanup_closed=True,
-                keepalive_timeout=20.0
-            )
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                },
-                timeout=aiohttp.ClientTimeout(total=30.0)
-            )
+                connector = aiohttp.TCPConnector(
+                    ssl=ssl_ctx,
+                    limit=self.concurrencia,
+                    enable_cleanup_closed=True,
+                    keepalive_timeout=20.0
+                )
+                self.session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30.0)
+                )
         return self.session
 
     async def renovar_sesion(self):
         """Cierra todos los sockets activos. Fuerza una nueva conexión en el próximo intento."""
-        if self.session and not self.session.closed:
-            await self.session.close()
-        self.session = None
+        async with self._lock: # ← Protegemos la destrucción también
+            if self.session and not self.session.closed:
+                await self.session.close()
+            self.session = None
 
 class CircuitBreaker:
     def __init__(self, session_manager, umbral_fallas: int = 3, pausa_base_s: float = 60.0):
         self.session_manager = session_manager
+        self._estado       = "CERRADO"  # Estados: CERRADO, ABIERTO, PRUEBA
         self._event        = asyncio.Event()
         self._event.set()
         self._fallas       = 0
@@ -137,13 +145,15 @@ class CircuitBreaker:
         self._lock         = asyncio.Lock()
 
     async def registrar_falla(self):
-        """Llamar cuando obtener_html_detalle o una vista falla con error de red/5xx."""
+        """Llamar cuando hay error de red/5xx."""
         async with self._lock:
             self._fallas += 1
-            if self._fallas >= self._umbral and self._event.is_set():
-                self._event.clear()   # Abre el circuito
+            # Si estábamos en PRUEBA y falló, volvemos a castigar
+            if self._estado == "PRUEBA" or (self._estado == "CERRADO" and self._fallas >= self._umbral):
+                self._estado = "ABIERTO"
+                self._event.clear()
                 print(
-                    f"🔴 CIRCUIT BREAKER ABIERTO: {self._fallas} fallas consecutivas. "
+                    f"🔴 CIRCUIT BREAKER ABIERTO: Fallas detectadas. "
                     f"Pausando {self._pausa_actual:.0f}s antes de reintentar."
                 )
                 asyncio.create_task(self._reset_programado())
@@ -151,31 +161,50 @@ class CircuitBreaker:
     async def registrar_exito(self):
         """Llamar cuando una acta se completa exitosamente."""
         async with self._lock:
+            # Si estaba ABIERTO, ignoramos éxitos de tareas rezagadas (fantasma)
+            if self._estado == "ABIERTO":
+                return
+                
             if self._fallas > 0:
                 self._fallas       = 0
-                self._pausa_actual = self._pausa_base  # reset del backoff
-                if not self._event.is_set():
-                    self._event.set()
-                    print("🟢 CIRCUIT BREAKER CERRADO: INPI respondiendo normalmente.")
+                self._pausa_actual = self._pausa_base
+                if self._estado == "PRUEBA":
+                    self._estado = "CERRADO"
+                    self._event.set() # Abre la compuerta para todos
+                    print("🟢 CIRCUIT BREAKER CERRADO: Explorador exitoso. INPI normalizado.")
 
     async def esperar_si_abierto(self):
-        if not self._event.is_set():
-            print("⏸️  Circuit breaker abierto — esperando recuperación del INPI...")
+        """Bloquea a los workers si hay problemas, o deja pasar a uno solo si es PRUEBA."""
+        while True:
+            async with self._lock:
+                if self._estado == "CERRADO":
+                    return # Pasan todos libremente
+                
+                if self._estado == "PRUEBA":
+                    # ¡Dejo pasar a ESTE worker como explorador!
+                    self._estado = "ABIERTO" # Vuelvo a cerrar la puerta atrás suyo
+                    print("🕵️  CIRCUIT BREAKER: Enviando worker explorador para probar conexión...")
+                    return
+
+            # Si está ABIERTO, espero pacientemente (0% CPU)
             await self._event.wait()
-            # JITTER: Evita que todos los workers disparen el request en el mismo milisegundo
-            await asyncio.sleep(random.uniform(0.5, 3.5))
 
     async def _reset_programado(self):
         await asyncio.sleep(self._pausa_actual)
         async with self._lock:
-            # Matamos la sesión envenenada ANTES de despertar a los workers
+            # Purgamos la sesión TCP envenenada
             await self.session_manager.renovar_sesion()
             
-            # Limitado a 300.0s (5 min) para evitar superar el SQS Visibility Timeout (700s)
-            self._pausa_actual = min(self._pausa_actual * 2, 300.0)
-            self._fallas       = 0
+            self._pausa_actual = min(self._pausa_actual * 2, 300.0) # Cap a 5 min
+            self._estado = "PRUEBA"
+            
+            # Despierto a TODOS los que estaban esperando con un "pulso".
+            # El while True de esperar_si_abierto hará que compitan por el lock.
+            # El primero entrará, verá "PRUEBA", pasará y lo pondrá en "ABIERTO".
+            # Los demás verán "ABIERTO" y se volverán a dormir. ¡Magia!
             self._event.set()
-            print(f"🟡 CIRCUIT BREAKER SEMI-ABIERTO: probando reconexión (Sesión TCP purgada).")
+            self._event.clear()
+            print(f"🟡 CIRCUIT BREAKER SEMI-ABIERTO: Reclutando explorador...")
 
 
 # ── Cliente SQS ───────────────────────────────────────────────────────────────
@@ -279,8 +308,8 @@ async def extraer_y_encolar(
         await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
  
         for intento in range(1, MAX_INTENTOS + 1):
+            await circuit_breaker.esperar_si_abierto()
             try:
-                await circuit_breaker.esperar_si_abierto()
                 session = await session_manager.obtener_sesion()
 
                 async with sem_inpi:
@@ -387,15 +416,17 @@ async def extraer_y_encolar(
                 })
                 return
  
-            except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as e:
+            except (asyncio.TimeoutError, 
+                    aiohttp.ClientConnectorError, 
+                    aiohttp.ServerDisconnectedError, 
+                    aiohttp.ClientResponseError) as e:
+                
                 await circuit_breaker.registrar_falla()  
-                print(
-                    f"⌛ Timeout/Red en acta {nro_acta} "
-                    f"(intento {intento}/{MAX_INTENTOS}): {type(e).__name__}"
-                )
+                print(f"⌛ Timeout/Red en acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {type(e).__name__}")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
  
             except Exception as e:
+                # Errores de lógica, parseo, etc. NO disparan el breaker.
                 print(f"⚠️ Error acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {e}")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
  
