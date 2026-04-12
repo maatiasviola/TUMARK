@@ -424,23 +424,29 @@ async def extraer_y_encolar(
                 })
                 return
  
+            except aiohttp.ClientResponseError as e:
+                # Si es un bloqueo por WAF (403), Rate Limit (429) o Gateway Caído (502/503/504)
+                if e.status in [403, 429, 502, 503, 504]:
+                    await circuit_breaker.registrar_falla()
+                
+                # Los HTTP 500 (error interno de INPI) NO suman fallas al CB, son culpa de su DB.
+                print(f"⚠️ HTTP {e.status} en acta {nro_acta} (intento {intento}/{MAX_INTENTOS})")
+                metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
+                intento += 1
             except (asyncio.TimeoutError, 
                     aiohttp.ClientConnectorError, 
-                    aiohttp.ServerDisconnectedError, 
-                    aiohttp.ClientResponseError) as e:
+                    aiohttp.ServerDisconnectedError) as e:
                 
+                # Errores puros de TCP/Conexión caída. Estos SÍ disparan el Circuit Breaker.
                 await circuit_breaker.registrar_falla()  
                 print(f"⌛ Timeout/Red en acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {type(e).__name__}")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
                 intento += 1
+
             except Exception as e:
-                print(f"⚠️ Error acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {e}")
+                print(f"⚠️ Error lógico en acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {e}")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
-                intento += 1 # INCREMENTAMOS EL INTENTO (Error de parseo/lógica)
- 
-            if intento <= MAX_INTENTOS:
-                backoff = (2 ** (intento - 1)) + random.uniform(0, 1)
-                await asyncio.sleep(backoff)
+                intento += 1
  
         print(f"❌ Acta {nro_acta} agotó {MAX_INTENTOS} intentos.")
  
@@ -469,7 +475,7 @@ async def worker_sqs():
     )
 
     session_manager = SessionManager(CONCURRENCIA_MAXIMA)
-    circuit_breaker = CircuitBreaker(session_manager, umbral_fallas=3, pausa_base_s=90.0)
+    circuit_breaker = CircuitBreaker(session_manager, umbral_fallas=15, pausa_base_s=30.0)
 
     loop = asyncio.get_running_loop()
     loop.set_default_executor(executor_io)
