@@ -200,8 +200,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
                 datos.get('denominacion'),  datos.get('fecha_ingreso'),
                 datos.get('fecha_vencimiento'), nro_res,
                 datos.get('fecha_resolucion'), datos.get('es_clase_completa'),
-                datos.get('boletin_resolucion'), datos.get('fecha_disposicion'), 
-                datos.get('nro_disposicion')
+                datos.get('boletin_resolucion'), datos.get('fecha_disposicion')
             )
 
         map_nroacta_idacta = {}
@@ -211,7 +210,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
                     nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen,
                     id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento,
                     nro_resolucion, fecha_resolucion, es_clase_completa,
-                    boletin_resolucion, fecha_disposicion, nro_disposicion
+                    boletin_resolucion, fecha_disposicion
                 ) VALUES %s
                 ON CONFLICT (nro_acta) DO UPDATE SET
                     id_estado_tramite  = EXCLUDED.id_estado_tramite,
@@ -221,8 +220,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
                     nro_resolucion     = EXCLUDED.nro_resolucion,
                     fecha_resolucion   = EXCLUDED.fecha_resolucion,
                     boletin_resolucion = EXCLUDED.boletin_resolucion,
-                    fecha_disposicion  = EXCLUDED.fecha_disposicion,
-                    nro_disposicion    = EXCLUDED.nro_disposicion
+                    fecha_disposicion  = EXCLUDED.fecha_disposicion
                 RETURNING nro_acta, id_acta;
             """, sorted(actas_dict.values(), key=lambda r: r[0]))
             for r in cur.fetchall():
@@ -352,7 +350,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
                 VALUES %s 
                 ON CONFLICT ON CONSTRAINT uq_acta_renovacion DO NOTHING;
             """, list(renovaciones_dict))
-            
+
         conn.commit()
         print(f"🚀 LOTE OK: {len(actas_dict)} actas · {len(agentes_dict)} agentes · {len(boletines_dict)} boletines")
         return True
