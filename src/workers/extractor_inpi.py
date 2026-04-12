@@ -283,14 +283,8 @@ async def watchdog_estado(cola_resultados, sem_tareas, executor_io, executor_par
 
 
 async def extraer_y_encolar(
-    session_manager,
-    mensaje_body,
-    receipt_handle,
-    sem_inpi,
-    sem_tareas,
-    cola_resultados,
-    executor_parser,
-    circuit_breaker 
+    session_manager, mensaje_body, receipt_handle, sem_inpi, sem_tareas, 
+    cola_resultados, executor_parser, circuit_breaker 
 ):
     loop = asyncio.get_running_loop()
  
@@ -307,12 +301,20 @@ async def extraer_y_encolar(
 
         await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
  
-        for intento in range(1, MAX_INTENTOS + 1):
+        intento = 1
+        while intento <= MAX_INTENTOS:
             await circuit_breaker.esperar_si_abierto()
             try:
-                session = await session_manager.obtener_sesion()
-
                 async with sem_inpi:
+                    if circuit_breaker._estado == "ABIERTO":
+                        # El CB se abrió mientras esperábamos en la cola del semáforo.
+                        # Liberamos el semáforo y reiniciamos el loop SIN gastar el intento.
+                        await asyncio.sleep(0.1)
+                        continue 
+                        
+                    # 2. LATE BINDING: Pedimos la sesión justo antes de disparar
+                    session = await session_manager.obtener_sesion()
+                    
                     html = await asyncio.wait_for(
                         inpi_marcas.obtener_html_detalle(session, nro_acta),
                         timeout=25.0
@@ -360,14 +362,20 @@ async def extraer_y_encolar(
                 cods   = [v.get("_cod_vista") for v in vistas]
  
                 if any(cods):
-                    async def _vista_noop() -> None:
-                        return None
+                    # Wrapper asíncrono para proteger cada vista individualmente
+                    async def fetch_vista_seguro(cod):
+                        if not cod: return None
+                        while True: # Bucle de protección interno
+                            await circuit_breaker.esperar_si_abierto()
+                            async with sem_inpi:
+                                if circuit_breaker._estado == "ABIERTO":
+                                    await asyncio.sleep(0.1)
+                                    continue # Volvemos a chequear sin fallar
+                                
+                                session_vista = await session_manager.obtener_sesion()
+                                return await inpi_marcas.obtener_texto_vista_async(session_vista, cod)
 
-                    tareas = [
-                        inpi_marcas.obtener_texto_vista_async(session, cod, sem_inpi)
-                        if cod else _vista_noop()
-                        for cod in cods
-                    ]
+                    tareas = [fetch_vista_seguro(cod) for cod in cods]
                     textos = await asyncio.gather(*tareas, return_exceptions=True)
  
                     errores = [
@@ -424,20 +432,17 @@ async def extraer_y_encolar(
                 await circuit_breaker.registrar_falla()  
                 print(f"⌛ Timeout/Red en acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {type(e).__name__}")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
- 
+                intento += 1
             except Exception as e:
-                # Errores de lógica, parseo, etc. NO disparan el breaker.
                 print(f"⚠️ Error acta {nro_acta} (intento {intento}/{MAX_INTENTOS}): {e}")
                 metricas.registrar_error(reintento=(intento < MAX_INTENTOS))
+                intento += 1 # INCREMENTAMOS EL INTENTO (Error de parseo/lógica)
  
-            if intento < MAX_INTENTOS:
-                backoff = (2 ** intento) + random.uniform(0, 1)
+            if intento <= MAX_INTENTOS:
+                backoff = (2 ** (intento - 1)) + random.uniform(0, 1)
                 await asyncio.sleep(backoff)
  
-        print(
-            f"❌ Acta {nro_acta} agotó {MAX_INTENTOS} intentos. "
-            f"SQS repondrá el mensaje al vencer el visibility timeout."
-        )
+        print(f"❌ Acta {nro_acta} agotó {MAX_INTENTOS} intentos.")
  
     finally:
         sem_tareas.release()

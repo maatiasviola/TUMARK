@@ -115,8 +115,7 @@ async def obtener_html_detalle(session, nro_acta, proxy=None):
 
 async def obtener_texto_vista_async(
     session:    aiohttp.ClientSession,
-    cod_vista:  str,
-    sem_inpi:   asyncio.Semaphore,
+    cod_vista:  str
 ) -> str:
     """
     [ASYNC] Fase 2: descarga el texto de una vista.
@@ -139,18 +138,17 @@ async def obtener_texto_vista_async(
     # Delay antes del semáforo — no ocupa slot de concurrencia
     #await asyncio.sleep(0.05)
 
-    async with sem_inpi:
-        async with session.get(
-            URL_DETALLE_VISTA,
-            headers={k: v for k, v in HEADERS.items() if k != "Content-Type"},
-            params={"Cod_VistaExp": cod_vista},
-            timeout=aiohttp.ClientTimeout(total=15.0),
-        ) as response:
-            if response.status != 200:
-                raise aiohttp.ClientResponseError(
-                    response.request_info, response.history, status=response.status
-                )
-            texto = await response.text()
-            if not texto or len(texto) < 10:
-                raise ValueError(f"Vista {cod_vista}: respuesta vacía.")
-            return texto
+    async with session.get(
+        URL_DETALLE_VISTA,
+        headers={k: v for k, v in HEADERS.items() if k != "Content-Type"},
+        params={"Cod_VistaExp": cod_vista},
+        timeout=aiohttp.ClientTimeout(total=15.0),
+    ) as response:
+        if response.status != 200:
+            raise aiohttp.ClientResponseError(
+                response.request_info, response.history, status=response.status
+            )
+        texto = await response.text()
+        if not texto or len(texto) < 10:
+            raise ValueError(f"Vista {cod_vista}: respuesta vacía.")
+        return texto
