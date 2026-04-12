@@ -96,14 +96,35 @@ def tipo_requiere_denominacion(tipo_marca_str):
         return True
     return tipo_marca_str.strip().upper() not in TIPOS_SIN_DENOMINACION
 
-def extraer_fecha_resolucion(soup):
-    span_label = soup.find('span', string=re.compile(r"FEC DE PROY:", re.I)) or \
-                 soup.find('span', string=re.compile(r"Fecha:", re.I))
-    if span_label:
-        valor = span_label.find_next('span', class_='text-danger')
-        if valor:
-            return valor.get_text(strip=True)
-    return ""
+def extraer_datos_resolucion_disposicion(soup):
+    panel = soup.find(id='collapse-nine')
+    res = {"fecha_resolucion": "", "fecha_disposicion": ""}
+    if not panel:
+        return res
+        
+    # 1. Fecha de Resolución (FEC DE PROY)
+    lbl_proy = panel.find(string=re.compile(r"FEC DE PROY\s*:", re.I))
+    if lbl_proy and lbl_proy.parent:
+        span_proy = lbl_proy.parent.find('span', class_='text-danger')
+        if span_proy:
+            res["fecha_resolucion"] = span_proy.get_text(strip=True)
+    else:
+        # Fallback para actas muy viejas que solo decían "Fecha:"
+        lbl_fecha = panel.find('span', string=re.compile(r"Fecha:", re.I))
+        if lbl_fecha:
+            span_val = lbl_fecha.find_next('span', class_='text-danger')
+            if span_val:
+                res["fecha_resolucion"] = span_val.get_text(strip=True)
+
+    # 2. Datos de Disposición
+    lbl_disp = panel.find(string=re.compile(r"DISPOSICION\s*:", re.I))
+    if lbl_disp and lbl_disp.parent:
+        # Buscamos todos los textos en rojo dentro de la etiqueta DISPOSICION
+        spans_danger = lbl_disp.parent.find_all('span', class_='text-danger')
+        if len(spans_danger) >= 1:
+            res["fecha_disposicion"] = spans_danger[0].get_text(strip=True)
+            
+    return res
 
 def extraer_estado_tramite(soup):
     candidatos = soup.find_all(string=re.compile(r"TIPO", re.I))
@@ -279,6 +300,8 @@ def parsear_detalle_html(html: str, nro_acta) -> dict | None:
     if denominacion_raw is None and tipo_requiere_denominacion(tipo_marca_raw):
         print(f"   ⚠️ [Acta {nro_acta}] No se encontró DENOMINACIÓN (Tipo: {tipo_marca_raw or 'DESCONOCIDO'}).")
 
+    datos_res_disp = extraer_datos_resolucion_disposicion(soup)
+
     datos = {
         "nro_acta":          int(nro_acta),
         "denominacion":      denominacion_raw.upper() if denominacion_raw else "",
@@ -291,7 +314,8 @@ def parsear_detalle_html(html: str, nro_acta) -> dict | None:
         "url_imagen":        url_img,
         "nro_resolucion":    nro_res_raw,
         "estado_tramite":    extraer_estado_tramite(soup),
-        "fecha_resolucion":  normalizar_fecha_str(extraer_fecha_resolucion(soup)),
+        "fecha_resolucion":  normalizar_fecha_str(datos_res_disp["fecha_resolucion"]),
+        "fecha_disposicion": normalizar_fecha_str(datos_res_disp["fecha_disposicion"])
     }
 
     texto_prot = datos.get('proteccion', '') or ""

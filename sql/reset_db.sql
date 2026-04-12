@@ -111,6 +111,7 @@ CREATE TABLE actas (
     nro_resolucion INT,
     boletin_resolucion INT,
     fecha_resolucion DATE,
+    fecha_disposicion DATE,
     es_clase_completa BOOLEAN,
     renovacion INT[]
 );

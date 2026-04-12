@@ -200,7 +200,8 @@ def _ejecutar_lote(conn, lista_datos_raw):
                 datos.get('denominacion'),  datos.get('fecha_ingreso'),
                 datos.get('fecha_vencimiento'), nro_res,
                 datos.get('fecha_resolucion'), datos.get('es_clase_completa'),
-                datos.get('renovacion'),    datos.get('boletin_resolucion')
+                datos.get('renovacion'),    datos.get('boletin_resolucion'),
+                datos.get('fecha_disposicion')
             )
 
         map_nroacta_idacta = {}
@@ -210,17 +211,18 @@ def _ejecutar_lote(conn, lista_datos_raw):
                     nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen,
                     id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento,
                     nro_resolucion, fecha_resolucion, es_clase_completa,
-                    renovacion, boletin_resolucion
+                    renovacion, boletin_resolucion, fecha_disposicion
                 ) VALUES %s
                 ON CONFLICT (nro_acta) DO UPDATE SET
-                    id_estado_tramite = EXCLUDED.id_estado_tramite,
-                    id_marca          = EXCLUDED.id_marca,
-                    denominacion      = EXCLUDED.denominacion,
-                    fecha_vencimiento = EXCLUDED.fecha_vencimiento,
-                    nro_resolucion    = EXCLUDED.nro_resolucion,
-                    fecha_resolucion  = EXCLUDED.fecha_resolucion,
-                    renovacion        = EXCLUDED.renovacion,
-                    boletin_resolucion = EXCLUDED.boletin_resolucion
+                    id_estado_tramite  = EXCLUDED.id_estado_tramite,
+                    id_marca           = EXCLUDED.id_marca,
+                    denominacion       = EXCLUDED.denominacion,
+                    fecha_vencimiento  = EXCLUDED.fecha_vencimiento,
+                    nro_resolucion     = EXCLUDED.nro_resolucion,
+                    fecha_resolucion   = EXCLUDED.fecha_resolucion,
+                    renovacion         = EXCLUDED.renovacion,
+                    boletin_resolucion = EXCLUDED.boletin_resolucion,
+                    fecha_disposicion  = EXCLUDED.fecha_disposicion
                 RETURNING nro_acta, id_acta;
             """, sorted(actas_dict.values(), key=lambda r: r[0]))
             for r in cur.fetchall():
