@@ -276,8 +276,6 @@ def parsear_detalle_html(html: str, nro_acta) -> dict | None:
     limitacion_raw   = extraer_de_seccion(soup, "accordion-2", "LIMITACION:")
     nro_res_raw      = extraer_de_seccion(soup, "accordion-9", "NRO:")
 
-    if clase_raw is None:
-        print(f"   ⚠️ [Acta {nro_acta}] No se encontró CLASE. Se guardará como NULL.")
     if denominacion_raw is None and tipo_requiere_denominacion(tipo_marca_raw):
         print(f"   ⚠️ [Acta {nro_acta}] No se encontró DENOMINACIÓN (Tipo: {tipo_marca_raw or 'DESCONOCIDO'}).")
 
@@ -306,9 +304,13 @@ def parsear_detalle_html(html: str, nro_acta) -> dict | None:
     for v in vistas_raw:
         v_limpio = {k: (normalizar_fecha_str(val) if isinstance(val, str) else val)
                     for k, val in v.items()}
-        v_limpio["Tipo"]                    = (v.get("Tipo", "").strip() or None)
+        
+        # FIX: Evitamos crash si el INPI manda {"Tipo": null}
+        val_tipo = v.get("Tipo")
+        v_limpio["Tipo"] = val_tipo.strip() if isinstance(val_tipo, str) else None
+        
         v_limpio["nro_oposicion_vinculada"]  = None 
-        v_limpio["_cod_vista"]              = v.get("Cod_VistaExp")
+        v_limpio["_cod_vista"] = v.get("Cod_VistaExp")
         vistas_finales.append(v_limpio)
 
     datos["vistas"]         = vistas_finales

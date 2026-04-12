@@ -307,12 +307,12 @@ async def extraer_y_encolar(
                 
                 # 1. Rellenar la Clase Niza si el Detalle del Acta vino fallado
                 id_clase_parser = datos.get("id_clase")
-                if (not id_clase_parser or str(id_clase_parser).strip() == "") and clase_grilla is not None:
-                    datos["id_clase"] = clase_grilla
-                    # Limpiamos los flags de error de Data Quality porque lo salvamos
-                    datos["requiere_revision"] = False 
-                    datos["detalle_revision"] = None
-                    print(f"  ✨ [Acta {nro_acta}] Clase salvada por la Grilla: {clase_grilla}")
+                if not id_clase_parser or str(id_clase_parser).strip() == "":
+                    if clase_grilla is not None:
+                        datos["id_clase"] = clase_grilla
+                        # Se salvó por grilla: guardamos silencio, es el comportamiento esperado.
+                    else:
+                        print(f"   ⚠️ [Acta {nro_acta}] No se encontró CLASE en HTML ni en Grilla. Se guardará como NULL.")
 
                 # 2. Imponer el Estado de la Grilla (Es la fuente de verdad)
                 if estado_grilla:
