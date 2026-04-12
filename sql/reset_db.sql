@@ -112,8 +112,7 @@ CREATE TABLE actas (
     boletin_resolucion INT,
     fecha_resolucion DATE,
     fecha_disposicion DATE,
-    es_clase_completa BOOLEAN,
-    renovacion INT[]
+    es_clase_completa BOOLEAN
 );
 
 CREATE TABLE actas_subitems_desnormalizados (
@@ -180,6 +179,15 @@ CREATE TABLE actas_boletines (
     id_boletin INTEGER REFERENCES boletines(id_boletin), 
     PRIMARY KEY (id_acta, id_boletin)
 );
+
+CREATE TABLE IF NOT EXISTS actas_renovaciones (
+    id_acta BIGINT REFERENCES actas(id_acta) ON DELETE CASCADE,
+    nro_acta_renovada INTEGER,
+    CONSTRAINT uq_acta_renovacion UNIQUE (id_acta, nro_acta_renovada)
+);
+
+-- Creamos un índice para búsquedas inversas (saber quién renovó a un acta vieja)
+CREATE INDEX idx_actas_renov_nro_vieja ON actas_renovaciones(nro_acta_renovada);
 
 -- ==========================================
 -- 5. TABLAS DE USUARIOS Y APP

@@ -200,8 +200,8 @@ def _ejecutar_lote(conn, lista_datos_raw):
                 datos.get('denominacion'),  datos.get('fecha_ingreso'),
                 datos.get('fecha_vencimiento'), nro_res,
                 datos.get('fecha_resolucion'), datos.get('es_clase_completa'),
-                datos.get('renovacion'),    datos.get('boletin_resolucion'),
-                datos.get('fecha_disposicion')
+                datos.get('boletin_resolucion'), datos.get('fecha_disposicion'), 
+                datos.get('nro_disposicion')
             )
 
         map_nroacta_idacta = {}
@@ -211,7 +211,7 @@ def _ejecutar_lote(conn, lista_datos_raw):
                     nro_acta, id_marca, id_clase, id_estado_tramite, id_imagen,
                     id_tipo_marca, denominacion, fecha_ingreso, fecha_vencimiento,
                     nro_resolucion, fecha_resolucion, es_clase_completa,
-                    renovacion, boletin_resolucion, fecha_disposicion
+                    boletin_resolucion, fecha_disposicion, nro_disposicion
                 ) VALUES %s
                 ON CONFLICT (nro_acta) DO UPDATE SET
                     id_estado_tramite  = EXCLUDED.id_estado_tramite,
@@ -220,9 +220,9 @@ def _ejecutar_lote(conn, lista_datos_raw):
                     fecha_vencimiento  = EXCLUDED.fecha_vencimiento,
                     nro_resolucion     = EXCLUDED.nro_resolucion,
                     fecha_resolucion   = EXCLUDED.fecha_resolucion,
-                    renovacion         = EXCLUDED.renovacion,
                     boletin_resolucion = EXCLUDED.boletin_resolucion,
-                    fecha_disposicion  = EXCLUDED.fecha_disposicion
+                    fecha_disposicion  = EXCLUDED.fecha_disposicion,
+                    nro_disposicion    = EXCLUDED.nro_disposicion
                 RETURNING nro_acta, id_acta;
             """, sorted(actas_dict.values(), key=lambda r: r[0]))
             for r in cur.fetchall():
@@ -337,6 +337,22 @@ def _ejecutar_lote(conn, lista_datos_raw):
         if subitems_desnorm:
             execute_values(cur, "INSERT INTO actas_subitems_desnormalizados (id_acta, subitem_desnormalizado) VALUES %s;", sorted(set(subitems_desnorm), key=lambda r: (r[0], r[1])))
 
+        # ── FASE 11: Renovaciones (Tabla Puente) ──────────────────────────────
+        renovaciones_dict = set()
+        for datos in lista:
+            id_a = map_nroacta_idacta.get(datos['nro_acta'])
+            if id_a and datos.get('renovacion'):
+                # datos['renovacion'] viene como una lista de enteros desde el parser
+                for nro_renovada in datos['renovacion']:
+                    renovaciones_dict.add((id_a, int(nro_renovada)))
+
+        if renovaciones_dict:
+            execute_values(cur, """
+                INSERT INTO actas_renovaciones (id_acta, nro_acta_renovada) 
+                VALUES %s 
+                ON CONFLICT ON CONSTRAINT uq_acta_renovacion DO NOTHING;
+            """, list(renovaciones_dict))
+            
         conn.commit()
         print(f"🚀 LOTE OK: {len(actas_dict)} actas · {len(agentes_dict)} agentes · {len(boletines_dict)} boletines")
         return True
