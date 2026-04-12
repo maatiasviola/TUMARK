@@ -26,6 +26,31 @@ FASES = {
         "n_workers": 10,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "0.3", "DELAY_MAX": "1.2"},
     },
+    "hist_2000_2004": {
+        "chunks": [("2000-01-01", "2004-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_2005_2009": {
+        "chunks": [("2005-01-01", "2009-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_2010_2015": {
+        "chunks": [("2010-01-01", "2015-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_2016_2020": {
+        "chunks": [("2016-01-01", "2020-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_2021_2026": {
+        "chunks": [("2021-01-01", "2026-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
 }
 
 def sembrar(fase: str, esperar_fin: bool = True) -> list:

@@ -495,6 +495,7 @@ async def worker_sqs():
             el productor frena automáticamente cuando el consumidor está lento.
             """
             ciclos_vacios = 0
+            MAX_CICLOS_VACIOS = 15
 
             while True:
                 try:
@@ -513,18 +514,22 @@ async def worker_sqs():
 
                 if not mensajes:
                     ciclos_vacios += 1
+                    activas = len(_tasks_activas)
                     # Cada ~60s informamos el estado.
                     # Cola vacía puede significar: (a) proceso terminado,
                     # (b) todos los mensajes están en visibility timeout
                     #     (tareas aún corriendo). En (b) vuelven solos.
                     if ciclos_vacios % 3 == 1:
-                        activas = len(_tasks_activas)
                         print(
                             f"📭 SQS sin mensajes visibles ({ciclos_vacios} ciclos). "
                             f"Tasks activas: {activas}. "
                             + ("Actas en vuelo, aguardando..." if activas > 0
                                else "Cola vacía o proceso terminado.")
                         )
+                    if ciclos_vacios >= MAX_CICLOS_VACIOS and activas == 0 and cola_resultados.empty():
+                        print("🏁 Cola SQS totalmente vacía por 5 minutos. Apagando worker para evitar costos.")
+                        os._exit(0)  # Esto mata el proceso limpio. El Bash de EC2 detectará la caída y apagará el servidor.
+                    
                     await asyncio.sleep(1)
                     continue
 
