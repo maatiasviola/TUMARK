@@ -26,6 +26,36 @@ FASES = {
         "n_workers": 10,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "0.3", "DELAY_MAX": "1.2"},
     },
+    "hist_1970_1974": {
+        "chunks": [("1970-01-01", "1974-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_1975_1979": {
+        "chunks": [("1975-01-01", "1979-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_1980_1984": {
+        "chunks": [("1980-01-01", "1984-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_1985_1989": {
+        "chunks": [("1985-01-01", "1989-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_1990_1994": {
+        "chunks": [("1990-01-01", "1994-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_1995_1999": {
+        "chunks": [("1995-01-01", "1999-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
     "hist_2000_2004": {
         "chunks": [("2000-01-01", "2004-12-31")], 
         "n_workers": 30,
@@ -36,20 +66,30 @@ FASES = {
         "n_workers": 30,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
     },
-    "hist_2010_2015": {
-        "chunks": [("2010-01-01", "2015-12-31")], 
+    "hist_2010_2014": {
+        "chunks": [("2010-01-01", "2014-12-31")], 
         "n_workers": 30,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
     },
-    "hist_2016_2020": {
-        "chunks": [("2016-01-01", "2020-12-31")], 
+    "hist_2015_2019": {
+        "chunks": [("2015-01-01", "2019-12-31")], 
         "n_workers": 30,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
     },
-    "hist_2021_2026": {
-        "chunks": [("2021-01-01", "2026-12-31")], 
+    "hist_2020_2024": {
+        "chunks": [("2020-01-01", "2024-12-31")], 
         "n_workers": 30,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "hist_2025_2026": {
+        "chunks": [("2025-01-01", "2026-12-31")], 
+        "n_workers": 30,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
+    },
+    "prueba_un_dia": {
+        "chunks": [("2023-08-15", "2023-08-15")], 
+        "n_workers": 1,
+        "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.0", "DELAY_MAX": "2.0"}
     },
 }
 

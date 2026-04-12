@@ -1,28 +1,10 @@
 """
 html_parser.py — Parser HTML puro. Sin HTTP.
-
-ARQUITECTURA DE DOS FASES
-─────────────────────────
-  Fase 1 (este archivo): Parsear HTML estático + extraer IDs de vistas.
-    - No hace ninguna petición de red.
-    - Para cada vista, guarda _cod_vista en el dict.
-    - nro_oposicion_vinculada queda en None; el worker lo llena en Fase 2.
-
-  Fase 2 (worker_extractor.py): El worker usa su aiohttp session + sem_inpi
-    para descargar los textos de vistas de forma asíncrona y controlada.
-    Luego llama a enriquecer_vistas_con_textos() de este módulo para
-    inyectar nro_oposicion_vinculada en el dict ya parseado.
-
-POR QUÉ EL PARSER NO DEBE HACER HTTP
-──────────────────────────────────────
-  El parser corre en executor_parser (80 threads). HTTP síncrono ahí
-  = hasta 800 conexiones simultáneas al INPI = SSL EOF + rate limiting.
-  Con dos fases, sem_inpi en el worker limita la concurrencia total
-  (actas + vistas) a CONCURRENCIA=3. Matemáticamente imposible saturar al INPI.
 """
 
 import re
 import json
+import html as html_lib
 from datetime import datetime
 from bs4 import BeautifulSoup
 
@@ -114,8 +96,9 @@ def tipo_requiere_denominacion(tipo_marca_str):
         return True
     return tipo_marca_str.strip().upper() not in TIPOS_SIN_DENOMINACION
 
-def extraer_disposicion(soup):
-    span_label = soup.find('span', string=re.compile(r"Fecha:", re.I))
+def extraer_fecha_resolucion(soup):
+    span_label = soup.find('span', string=re.compile(r"FEC DE PROY:", re.I)) or \
+                 soup.find('span', string=re.compile(r"Fecha:", re.I))
     if span_label:
         valor = span_label.find_next('span', class_='text-danger')
         if valor:
@@ -176,6 +159,7 @@ def extraer_titulares_multiples(soup):
         label_nombre = nodo.find_parent('label')
         if not label_nombre:
             continue
+        
         valor_nombre_full = extraer_valor_flexible_elemento(label_nombre)
         nombre     = valor_nombre_full
         porcentaje = 100.0
@@ -186,15 +170,31 @@ def extraer_titulares_multiples(soup):
                 nombre     = valor_nombre_full.replace(match_porc.group(0), '').strip()
             except Exception:
                 pass
-        label_cuit  = label_nombre.find_next('label', string=re.compile(r"CUIT\s*:", re.I))
+                
+        label_cuit = label_nombre.find_next('label', string=re.compile(r"CUIT\s*:", re.I))
         cuit_limpio = "".join(filter(str.isdigit, extraer_valor_flexible_elemento(label_cuit) or ""))
-        label_pais  = label_nombre.find_next('label', string=re.compile(r"PAIS\s*:", re.I))
-        val_pais    = extraer_valor_flexible_elemento(label_pais)
+        
+        label_pais = label_nombre.find_next('label', string=re.compile(r"PAIS\s*:", re.I))
+        val_pais   = extraer_valor_flexible_elemento(label_pais)
+
+        # Nuevos campos
+        label_dom = label_nombre.find_next('label', string=re.compile(r"DOMICILIO REAL\s*:", re.I))
+        val_dom   = extraer_valor_flexible_elemento(label_dom)
+        
+        label_loc = label_nombre.find_next('label', string=re.compile(r"LOCALIDAD\s*:", re.I))
+        val_loc   = extraer_valor_flexible_elemento(label_loc)
+        
+        label_terr = label_nombre.find_next('label', string=re.compile(r"TERRITORIO LEGAL\s*:", re.I))
+        val_terr   = extraer_valor_flexible_elemento(label_terr)
+
         titulares.append({
             "nombre":    nombre.strip().upper(),
             "cuit_cuil": int(cuit_limpio) if cuit_limpio else None,
             "porcentaje": porcentaje,
             "pais":      val_pais.upper() if val_pais else "ARGENTINA",
+            "domicilio_real": val_dom.upper() if val_dom and val_dom != "----" else None,
+            "localidad": val_loc.upper() if val_loc and val_loc != "----" else None,
+            "territorio_legal": val_terr.upper() if val_terr and val_terr != "----" else None
         })
     return titulares
 
@@ -213,41 +213,33 @@ def extraer_nro_oposicion_profundo(html_contenido, nro_acta_filtro=None):
             continue
     return None
 
+def extraer_arrays_renovacion(html_chunk, etiqueta):
+    """Busca números de actas en etiquetas de renovación y devuelve una lista de enteros"""
+    match = re.search(fr'{etiqueta}\s*(?:<span[^>]*>)?\s*(.*?)\s*(?:</span>|</label>)', html_chunk, re.IGNORECASE)
+    if not match:
+        return []
+    numeros = re.findall(r'\d+', match.group(1))
+    return [int(n) for n in numeros]
 
 # ── Fase 2: inyección de resultados (llamado por el worker) ──────────────────
 
 def enriquecer_vistas_con_textos(vistas: list, textos: list, nro_acta) -> None:
-    """
-    Inyecta nro_oposicion_vinculada en cada vista usando los textos
-    descargados por el worker en Fase 2.
-
-    Modifica la lista in-place. No hace I/O.
-    textos[i] corresponde a vistas[i]. None significa que la descarga falló.
-    """
     for vista, texto in zip(vistas, textos):
         vista["nro_oposicion_vinculada"] = (
             extraer_nro_oposicion_profundo(texto, nro_acta_filtro=nro_acta)
             if texto else None
         )
 
-
 # ── Función principal — Fase 1 ───────────────────────────────────────────────
 
 def parsear_detalle_html(html: str, nro_acta) -> dict | None:
-    """
-    Fase 1: parsea HTML estático. No hace HTTP.
-
-    Para cada vista, guarda '_cod_vista' para que el worker descargue
-    el texto en Fase 2 y llame a enriquecer_vistas_con_textos().
-    """
-    if not html:
-        return None
+    if not html: return None
 
     soup = BeautifulSoup(html, 'html.parser')
 
     presentacion_raw = extraer_de_seccion(soup, "accordion-1", "PRESENTACIÓN:")
     if not presentacion_raw:
-        print(f"   🛑 [Acta {nro_acta}] INVARIANTE ROTO: HTML sin datos. Forzando reintento...")
+        print(f"   🛑 [Acta {nro_acta}] HTML sin datos (Posible 404 falso). Forzando reintento...")
         raise ValueError(f"Falso HTTP 200: Acta {nro_acta} sin fecha de presentación.")
 
     url_img = None
@@ -283,14 +275,12 @@ def parsear_detalle_html(html: str, nro_acta) -> dict | None:
         "url_imagen":        url_img,
         "nro_resolucion":    nro_res_raw,
         "estado_tramite":    extraer_estado_tramite(soup),
-        "fecha_disposicion": normalizar_fecha_str(extraer_disposicion(soup)),
+        "fecha_resolucion":  normalizar_fecha_str(extraer_fecha_resolucion(soup)),
     }
 
     texto_prot = datos.get('proteccion', '') or ""
     datos['es_clase_completa'] = texto_prot.strip().upper() == "TODA LA CLASE"
     datos["titulares"] = extraer_titulares_multiples(soup)
-    if not datos["titulares"]:
-        print(f"   ⚠️ [Acta {nro_acta}] No se encontraron TITULARES.")
 
     # Vistas: solo metadatos. _cod_vista pendiente de Fase 2.
     vistas_raw     = extraer_datos_js(html, "vistas")
@@ -299,14 +289,56 @@ def parsear_detalle_html(html: str, nro_acta) -> dict | None:
         v_limpio = {k: (normalizar_fecha_str(val) if isinstance(val, str) else val)
                     for k, val in v.items()}
         v_limpio["Tipo"]                    = (v.get("Tipo", "").strip() or None)
-        v_limpio["nro_oposicion_vinculada"]  = None   # pendiente Fase 2
+        v_limpio["nro_oposicion_vinculada"]  = None 
         v_limpio["_cod_vista"]              = v.get("Cod_VistaExp")
         vistas_finales.append(v_limpio)
 
     datos["vistas"]         = vistas_finales
     datos["oposiciones"]    = limpiar_lista_tramites(extraer_datos_js(html, "opos"))
     datos["transferencias"] = limpiar_lista_tramites(extraer_datos_js(html, "transferencias"))
-    datos["renuncias"]      = limpiar_lista_tramites(extraer_datos_js(html, "Renuncias"))
-    datos["demandas"]       = limpiar_lista_tramites(extraer_datos_js(html, "Demandas"))
+
+    # -- NUEVO: Agentes --
+    agentes = []
+    html_gestion = str(soup.find('div', id='collapse-tree') or "")
+    agente_match = re.search(r'AGENTE:\s*<span[^>]*>\s*(\d+)\s+(.*?)\s*</span>', html_gestion, re.IGNORECASE)
+    if agente_match:
+        agentes.append({
+            "nro_agente": int(agente_match.group(1)),
+            "nombre": html_lib.unescape(agente_match.group(2)).strip()
+        })
+    datos["agentes"] = agentes
+
+    # -- NUEVO: Boletines (Publicaciones) --
+    publicaciones = []
+    panel_pub = soup.find('div', id='collapse-six')
+    if panel_pub:
+        fechas = panel_pub.find_all(string=re.compile(r"FECHA\s*:", re.I))
+        for f_node in fechas:
+            lbl_f = f_node.find_parent('label')
+            if not lbl_f: continue
+            val_f = extraer_valor_flexible_elemento(lbl_f)
+            
+            lbl_n = lbl_f.find_next('label', string=re.compile(r"NÚMERO\s*:", re.I))
+            val_n = extraer_valor_flexible_elemento(lbl_n)
+            
+            if val_n and val_n.isdigit():
+                publicaciones.append({
+                    "nro_boletin": int(val_n),
+                    "fecha": normalizar_fecha_str(val_f)
+                })
+    datos["publicaciones"] = publicaciones
+
+    # -- NUEVO: Renovaciones --
+    html_gral = str(soup.find('div', id='collapse-One') or "")
+    datos["renovacion"]  = extraer_arrays_renovacion(html_gral, "RENOVADA POR:")
+
+    # -- NUEVO: Boletín Resolución --
+    html_res = str(soup.find('div', id='collapse-nine') or "")
+    b_match = re.search(r'Bolet[ií]n:\s*<span[^>]*>\s*(\d+)\s*</span>', html_res, re.IGNORECASE)
+    if b_match:
+        val = int(b_match.group(1))
+        datos["boletin_resolucion"] = val if val > 0 else None
+    else:
+        datos["boletin_resolucion"] = None
 
     return datos

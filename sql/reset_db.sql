@@ -75,12 +75,16 @@ CREATE TABLE titulares (
     identidad_hash TEXT UNIQUE NOT NULL, -- Clave MDM Híbrida (Hash de CUIT o Nombre)
     cuit_cuil BIGINT,                    -- Ya NO es UNIQUE
     nombre TEXT NOT NULL,                -- Ya NO es UNIQUE
-    pais TEXT
+    pais TEXT,
+    domicilio_real TEXT,
+    localidad TEXT,
+    territorio_legal TEXT
 );
 
 -- Índices recomendados para búsquedas analíticas posteriores
 CREATE INDEX idx_titulares_cuit ON titulares (cuit_cuil) WHERE cuit_cuil IS NOT NULL;
 CREATE INDEX idx_titulares_nombre ON titulares (nombre);
+
 
 CREATE TABLE marcas (
     id_marca SERIAL PRIMARY KEY,
@@ -104,8 +108,10 @@ CREATE TABLE actas (
     fecha_ingreso DATE,
     fecha_vencimiento DATE,
     nro_resolucion INT,
-    fecha_disposicion DATE,
-    es_clase_completa BOOLEAN
+    boletin_resolucion INT,
+    fecha_resolucion DATE,
+    es_clase_completa BOOLEAN,
+    renovacion INT[]
 );
 
 CREATE TABLE actas_subitems_desnormalizados (
@@ -146,6 +152,31 @@ CREATE TABLE vistas (
     fecha_contestacion DATE, 
     fecha_vencimiento DATE,
     CONSTRAINT uq_vistas_acta UNIQUE NULLS NOT DISTINCT (id_acta, id_tipo_vista, id_oposicion, fecha)
+);
+
+CREATE TABLE agentes (
+    id_agente SERIAL PRIMARY KEY,
+    nro_agente INT UNIQUE,
+    nombre TEXT NOT NULL
+);
+
+
+CREATE TABLE actas_agentes (
+    id_acta INT REFERENCES actas(id_acta),
+    id_agente INT REFERENCES agentes(id_agente),
+    PRIMARY KEY (id_acta, id_agente)
+);
+
+CREATE TABLE boletines (
+    id_boletin SERIAL PRIMARY KEY,
+    nro_boletin INT UNIQUE,
+    fecha_publicacion DATE
+);
+
+CREATE TABLE actas_boletines (
+    id_acta INTEGER REFERENCES actas(id_acta),
+    id_boletin INTEGER REFERENCES boletines(id_boletin)
+    PRIMARY KEY (id_acta, id_boletin)
 );
 
 -- ==========================================
