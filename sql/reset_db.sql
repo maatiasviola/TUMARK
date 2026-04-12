@@ -175,7 +175,7 @@ CREATE TABLE boletines (
 
 CREATE TABLE actas_boletines (
     id_acta INTEGER REFERENCES actas(id_acta),
-    id_boletin INTEGER REFERENCES boletines(id_boletin)
+    id_boletin INTEGER REFERENCES boletines(id_boletin), 
     PRIMARY KEY (id_acta, id_boletin)
 );
 
