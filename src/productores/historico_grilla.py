@@ -1,57 +1,27 @@
+"""
+Consulta la grilla del INPI en base a parámetros de fecha y puebla el SQS
+con las actas
+"""
+
 import asyncio
 import os
-import time
 import sys
+import time
 import aiohttp
-import boto3
-import json
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from src.clientes import inpi_marcas
-from src.config import settings
+from src.aws.sqs_manager import enviar_batch_actas
 
-# ← Estas dos líneas ya las tienen, solo asegurarse que estén una sola vez
 fecha_inicio      = datetime.fromisoformat(os.environ.get("DATE_FROM", "2024-01-01"))
 fecha_actual_tope = datetime.fromisoformat(os.environ.get("DATE_TO",   "2024-01-07"))
-
-sqs = boto3.client(
-    'sqs',
-    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-    region_name=settings.AWS_REGION
-)
-
-SQS_QUEUE_URL = settings.SQS_QUEUE_URL
-TAMANO_PAGINA = 1000
-
-def enviar_a_sqs_batch(lista_ids):
-    for i in range(0, len(lista_ids), 10):
-        batch = lista_ids[i:i + 10]
-        entries = [
-            {
-                'Id': str(item["nro_acta"]),
-                'MessageBody': json.dumps(item)
-            } 
-            for item in batch
-        ]
-
-        for intento in range(3):
-            if not entries:
-                break
-            response = sqs.send_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=entries)
-            fallidos = response.get('Failed', [])
-            if not fallidos:
-                break
-            print(f"   ⚠️ {len(fallidos)} mensajes fallaron en SQS. Reintentando ({intento + 1}/3)...")
-            ids_fallidos = {f['Id'] for f in fallidos}
-            entries = [e for e in entries if e['Id'] in ids_fallidos]
-            time.sleep(1)
+TAMANO_PAGINA     = 1000
 
 async def poblar_sqs_por_mes():
-    print(f"🚀 INICIANDO SEMBRADO | {fecha_inicio.date()} → {fecha_actual_tope.date()}")
+    print(f"🚀 INICIANDO SEMBRADO HISTÓRICO | {fecha_inicio.date()} → {fecha_actual_tope.date()}")
     cursor_fecha = fecha_inicio
 
     async with aiohttp.ClientSession() as session:
@@ -74,8 +44,13 @@ async def poblar_sqs_por_mes():
                 lista_actas = await inpi_marcas.obtener_lista_actas(session, payload)
                 if not lista_actas:
                     break
+                
+                # Inyectamos el origen para que el Worker sepa de dónde viene
+                for acta in lista_actas:
+                    acta["origen"] = "historico_grilla"
 
-                enviar_a_sqs_batch(lista_actas)
+                # Usamos nuestra nueva capa de infraestructura abstraída
+                enviar_batch_actas(lista_actas)
                 print(f"   ↳ {len(lista_actas)} IDs enviados a SQS.")
 
                 if len(lista_actas) < TAMANO_PAGINA:
@@ -85,7 +60,7 @@ async def poblar_sqs_por_mes():
 
             cursor_fecha = fecha_hasta_lote + timedelta(days=1)
 
-    print("🏁 Sembrado finalizado.")
+    print("🏁 Sembrado histórico finalizado.")
 
 if __name__ == "__main__":
     asyncio.run(poblar_sqs_por_mes())
