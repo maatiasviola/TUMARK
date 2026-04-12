@@ -87,7 +87,7 @@ FASES = {
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
     },
     "prueba_un_dia": {
-        "chunks": [("2023-08-15", "2023-08-16")], 
+        "chunks": [("04-12-1975", "04-12-1975")], 
         "n_workers": 1,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.0", "DELAY_MAX": "2.0"}
     },

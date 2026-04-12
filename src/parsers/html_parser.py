@@ -155,47 +155,65 @@ def extraer_titulares_multiples(soup):
     panel = soup.find('div', id='collapse-two')
     if not panel:
         return []
-    for nodo in panel.find_all(string=re.compile(r"NOMBRE\s*:", re.I)):
-        label_nombre = nodo.find_parent('label')
-        if not label_nombre:
-            continue
+    
+    # Encontramos todos los labels del panel y los iteramos en orden secuencial
+    labels = panel.find_all('label')
+    titular_actual = {}
+    
+    for lbl in labels:
+        txt = lbl.get_text(" ", strip=True).upper()
         
-        valor_nombre_full = extraer_valor_flexible_elemento(label_nombre)
-        nombre     = valor_nombre_full
-        porcentaje = 100.0
-        match_porc = re.search(r'(\d{1,3}(?:[.,]\d{1,2})?)\s*%', valor_nombre_full)
-        if match_porc:
-            try:
-                porcentaje = float(match_porc.group(1).replace(',', '.'))
-                nombre     = valor_nombre_full.replace(match_porc.group(0), '').strip()
-            except Exception:
-                pass
-                
-        label_cuit = label_nombre.find_next('label', string=re.compile(r"CUIT\s*:", re.I))
-        cuit_limpio = "".join(filter(str.isdigit, extraer_valor_flexible_elemento(label_cuit) or ""))
-        
-        label_pais = label_nombre.find_next('label', string=re.compile(r"PAIS\s*:", re.I))
-        val_pais   = extraer_valor_flexible_elemento(label_pais)
+        if txt.startswith("NOMBRE:"):
+            # Si ya estábamos procesando un titular, lo guardamos antes de empezar el nuevo
+            if titular_actual:
+                titulares.append(titular_actual)
+            titular_actual = {}
+            
+            valor_nombre_full = extraer_valor_flexible_elemento(lbl)
+            nombre = valor_nombre_full
+            porcentaje = 100.0
+            match_porc = re.search(r'(\d{1,3}(?:[.,]\d{1,2})?)\s*%', valor_nombre_full)
+            if match_porc:
+                try:
+                    porcentaje = float(match_porc.group(1).replace(',', '.'))
+                    nombre = valor_nombre_full.replace(match_porc.group(0), '').strip()
+                except Exception:
+                    pass
+            titular_actual["nombre"] = nombre.strip().upper()
+            titular_actual["porcentaje"] = porcentaje
+            
+        elif txt.startswith("CUIT:") and titular_actual is not None:
+            cuit_limpio = "".join(filter(str.isdigit, extraer_valor_flexible_elemento(lbl) or ""))
+            titular_actual["cuit_cuil"] = int(cuit_limpio) if cuit_limpio else None
+            
+        elif txt.startswith("PAIS:") and titular_actual is not None:
+            val_pais = extraer_valor_flexible_elemento(lbl)
+            titular_actual["pais"] = val_pais.upper() if val_pais else "ARGENTINA"
+            
+        elif txt.startswith("DOMICILIO REAL:") and titular_actual is not None:
+            val_dom = extraer_valor_flexible_elemento(lbl)
+            titular_actual["domicilio_real"] = val_dom.upper() if val_dom and val_dom != "----" else None
+            
+        elif txt.startswith("LOCALIDAD:") and titular_actual is not None:
+            val_loc = extraer_valor_flexible_elemento(lbl)
+            titular_actual["localidad"] = val_loc.upper() if val_loc and val_loc != "----" else None
+            
+        elif txt.startswith("TERRITORIO LEGAL:") and titular_actual is not None:
+            val_terr = extraer_valor_flexible_elemento(lbl)
+            titular_actual["territorio_legal"] = val_terr.upper() if val_terr and val_terr != "----" else None
 
-        # Nuevos campos
-        label_dom = label_nombre.find_next('label', string=re.compile(r"DOMICILIO REAL\s*:", re.I))
-        val_dom   = extraer_valor_flexible_elemento(label_dom)
+    # Guardamos el último titular procesado
+    if titular_actual:
+        titulares.append(titular_actual)
         
-        label_loc = label_nombre.find_next('label', string=re.compile(r"LOCALIDAD\s*:", re.I))
-        val_loc   = extraer_valor_flexible_elemento(label_loc)
+    # Llenamos con defaults en caso de que el INPI no haya puesto el campo
+    for t in titulares:
+        if "pais" not in t: t["pais"] = "ARGENTINA"
+        if "cuit_cuil" not in t: t["cuit_cuil"] = None
+        if "domicilio_real" not in t: t["domicilio_real"] = None
+        if "localidad" not in t: t["localidad"] = None
+        if "territorio_legal" not in t: t["territorio_legal"] = None
         
-        label_terr = label_nombre.find_next('label', string=re.compile(r"TERRITORIO LEGAL\s*:", re.I))
-        val_terr   = extraer_valor_flexible_elemento(label_terr)
-
-        titulares.append({
-            "nombre":    nombre.strip().upper(),
-            "cuit_cuil": int(cuit_limpio) if cuit_limpio else None,
-            "porcentaje": porcentaje,
-            "pais":      val_pais.upper() if val_pais else "ARGENTINA",
-            "domicilio_real": val_dom.upper() if val_dom and val_dom != "----" else None,
-            "localidad": val_loc.upper() if val_loc and val_loc != "----" else None,
-            "territorio_legal": val_terr.upper() if val_terr and val_terr != "----" else None
-        })
     return titulares
 
 def extraer_nro_oposicion_profundo(html_contenido, nro_acta_filtro=None):
@@ -299,33 +317,34 @@ def parsear_detalle_html(html: str, nro_acta) -> dict | None:
 
     # -- NUEVO: Agentes --
     agentes = []
+    import html as html_lib
     html_gestion = str(soup.find('div', id='collapse-tree') or "")
-    agente_match = re.search(r'AGENTE:\s*<span[^>]*>\s*(\d+)\s+(.*?)\s*</span>', html_gestion, re.IGNORECASE)
-    if agente_match:
+    for agente_match in re.finditer(r'AGENTE:\s*<span[^>]*>\s*(\d+)\s+(.*?)\s*</span>', html_gestion, re.IGNORECASE):
         agentes.append({
             "nro_agente": int(agente_match.group(1)),
             "nombre": html_lib.unescape(agente_match.group(2)).strip()
         })
     datos["agentes"] = agentes
 
-    # -- NUEVO: Boletines (Publicaciones) --
+    # -- NUEVO: Boletines / Publicaciones (Iterador a prueba de anidamiento) --
     publicaciones = []
     panel_pub = soup.find('div', id='collapse-six')
     if panel_pub:
-        fechas = panel_pub.find_all(string=re.compile(r"FECHA\s*:", re.I))
-        for f_node in fechas:
-            lbl_f = f_node.find_parent('label')
-            if not lbl_f: continue
-            val_f = extraer_valor_flexible_elemento(lbl_f)
-            
-            lbl_n = lbl_f.find_next('label', string=re.compile(r"NÚMERO\s*:", re.I))
-            val_n = extraer_valor_flexible_elemento(lbl_n)
-            
-            if val_n and val_n.isdigit():
-                publicaciones.append({
-                    "nro_boletin": int(val_n),
-                    "fecha": normalizar_fecha_str(val_f)
-                })
+        labels = panel_pub.find_all('label')
+        current_fecha = None
+        for lbl in labels:
+            txt = lbl.get_text(" ", strip=True).upper()
+            if txt.startswith("FECHA:"):
+                current_fecha = txt.replace("FECHA:", "").strip()
+            elif txt.startswith("NÚMERO:") and current_fecha:
+                # Extrae solo los dígitos, ignorando <a> o <span>
+                num_str = "".join(filter(str.isdigit, txt))
+                if num_str:
+                    publicaciones.append({
+                        "nro_boletin": int(num_str),
+                        "fecha": normalizar_fecha_str(current_fecha)
+                    })
+                current_fecha = None # Reseteamos para buscar la siguiente publicación
     datos["publicaciones"] = publicaciones
 
     # -- NUEVO: Renovaciones --
