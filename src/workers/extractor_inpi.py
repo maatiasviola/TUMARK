@@ -153,6 +153,71 @@ PARSER_WORKERS      = int(os.environ.get("PARSER_WORKERS",    "80"))
 IO_WORKERS          = int(os.environ.get("IO_WORKERS",        "10"))
 # Solo DB + SQS. Aislado del parser. 10 workers para ~2 usos simultáneos.
 
+class CircuitBreaker:
+    """
+    Pausa coordinada de todos los workers cuando el INPI está bloqueando.
+    
+    Estados:
+      CLOSED  → operación normal
+      OPEN    → INPI bloqueando, todas las tareas pausan
+      HALF    → prueba gradual de reconexión
+    
+    Por qué un asyncio.Event y no un Semaphore:
+      El Event permite que TODOS los workers sean notificados simultáneamente
+      cuando el circuito vuelve a cerrarse. Un Semaphore solo liberaría de a uno.
+    """
+    def __init__(self, umbral_fallas: int = 3, pausa_base_s: float = 60.0):
+        self._event        = asyncio.Event()
+        self._event.set()          # Arranca en CLOSED (verde)
+        self._fallas       = 0
+        self._umbral       = umbral_fallas
+        self._pausa_base   = pausa_base_s
+        self._pausa_actual = pausa_base_s
+        self._lock         = asyncio.Lock()
+
+    async def registrar_falla(self):
+        """Llamar cuando obtener_html_detalle o una vista falla con error de red/5xx."""
+        async with self._lock:
+            self._fallas += 1
+            if self._fallas >= self._umbral and self._event.is_set():
+                self._event.clear()   # Abre el circuito
+                print(
+                    f"🔴 CIRCUIT BREAKER ABIERTO: {self._fallas} fallas consecutivas. "
+                    f"Pausando {self._pausa_actual:.0f}s antes de reintentar."
+                )
+                # El reset no bloquea; se lanza como tarea separada
+                asyncio.create_task(self._reset_programado())
+
+    async def registrar_exito(self):
+        """Llamar cuando una acta se completa exitosamente."""
+        async with self._lock:
+            if self._fallas > 0:
+                self._fallas       = 0
+                self._pausa_actual = self._pausa_base  # reset del backoff
+                if not self._event.is_set():
+                    self._event.set()
+                    print("🟢 CIRCUIT BREAKER CERRADO: INPI respondiendo normalmente.")
+
+    async def esperar_si_abierto(self):
+        """
+        Los workers llaman esto ANTES de cada intento.
+        Si el circuito está abierto, bloquean aquí hasta que se cierre.
+        Durante la espera, asyncio cede el control (0% CPU).
+        """
+        if not self._event.is_set():
+            print("⏸️  Circuit breaker abierto — esperando recuperación del INPI...")
+            await self._event.wait()
+
+    async def _reset_programado(self):
+        await asyncio.sleep(self._pausa_actual)
+        async with self._lock:
+            self._pausa_actual = min(self._pausa_actual * 2, 600.0)  # max 10 min
+            self._fallas       = 0
+            self._event.set()
+            print(f"🟡 CIRCUIT BREAKER SEMI-ABIERTO: probando reconexión.")
+
+
+
 # ── Cliente SQS ───────────────────────────────────────────────────────────────
 sqs = boto3.client(
     'sqs',
@@ -250,6 +315,7 @@ async def extraer_y_encolar(
     sem_tareas,
     cola_resultados,
     executor_parser,
+    circuit_breaker 
 ):
     loop = asyncio.get_running_loop()
  
@@ -270,15 +336,20 @@ async def extraer_y_encolar(
  
         for intento in range(1, MAX_INTENTOS + 1):
             try:
-                # ── Fase 1a: HTTP al INPI — HTML del acta ────────────────────
+                await circuit_breaker.esperar_si_abierto()
+
                 async with sem_inpi:
                     html = await asyncio.wait_for(
                         inpi_marcas.obtener_html_detalle(session, nro_acta),
                         timeout=25.0
                     )
- 
+
                 if not html:
+                    await circuit_breaker.registrar_falla()   # ← falla coordinada
                     raise ValueError(f"HTML vacío o error HTTP para acta {nro_acta}")
+
+                # Si llegamos acá, el INPI respondió bien
+                await circuit_breaker.registrar_exito()
  
                 # ── Fase 1b: Parser en executor_parser (CPU-bound, sin HTTP) ──
                 try:
@@ -339,9 +410,12 @@ async def extraer_y_encolar(
                 cods   = [v.get("_cod_vista") for v in vistas]
  
                 if any(cods):
+                    async def _vista_noop() -> None:
+                        return None
+
                     tareas = [
                         inpi_marcas.obtener_texto_vista_async(session, cod, sem_inpi)
-                        if cod else asyncio.coroutine(lambda: None)()
+                        if cod else _vista_noop()       # ← compatible con Python 3.11+
                         for cod in cods
                     ]
                     textos = await asyncio.gather(*tareas, return_exceptions=True)
@@ -398,6 +472,7 @@ async def extraer_y_encolar(
                 return  # éxito
  
             except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as e:
+                await circuit_breaker.registrar_falla()  
                 print(
                     f"⌛ Timeout/Red en acta {nro_acta} "
                     f"(intento {intento}/{MAX_INTENTOS}): {type(e).__name__}"
@@ -423,6 +498,8 @@ async def extraer_y_encolar(
 
 async def worker_sqs():
     """Punto de entrada. Inicializa recursos y arranca productor + consumidor."""
+
+    circuit_breaker = CircuitBreaker(umbral_fallas=3, pausa_base_s=90.0)
 
     # ── Validación de configuración ───────────────────────────────────────────
     zombies_max = MAX_TAREAS_VUELO * MAX_INTENTOS
@@ -473,7 +550,13 @@ async def worker_sqs():
     transacciones.inicializar_cache_desde_db()
 
     ssl_ctx   = crear_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=CONCURRENCIA_MAXIMA)
+    connector = aiohttp.TCPConnector(
+        ssl=ssl_ctx, 
+        limit=CONCURRENCIA_MAXIMA,
+        keepalive_timeout=10.0,      # El INPI cierra conexiones rápido, no las guardes mucho tiempo
+        enable_cleanup_closed=True,  # Fuerza a aiohttp a limpiar sockets cerrados abruptamente
+        force_close=False            # Solo poné esto en True si el problema persiste (mata el Keep-Alive y degrada performance, pero es infalible)
+    )
 
     async with aiohttp.ClientSession(
         connector=connector,
@@ -549,6 +632,7 @@ async def worker_sqs():
                             sem_tareas,
                             cola_resultados,
                             executor_parser,
+                            circuit_breaker 
                         )
                     )
                     _tasks_activas.add(task)

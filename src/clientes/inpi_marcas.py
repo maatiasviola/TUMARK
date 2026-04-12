@@ -83,16 +83,7 @@ async def obtener_lista_actas(session, payload):
 
 
 async def obtener_html_detalle(session, nro_acta, proxy=None):
-    """
-    [ASYNC] Fase 1: descarga el HTML del detalle de un acta.
-
-    Valida que el body sea suficientemente grande. Una respuesta
-    < HTML_MIN_BYTES es rate limiting silencioso del INPI (HTTP 200 vacío).
-
-    NO registra metricas.registrar_error(): el caller (extraer_y_encolar)
-    tiene contexto del número de intento y es el único que debe registrar.
-    """
-    t0      = time.time()
+    t0 = time.time()
     payload = {"acta": nro_acta}
     try:
         async with session.post(
@@ -103,18 +94,22 @@ async def obtener_html_detalle(session, nro_acta, proxy=None):
             timeout=30
         ) as response:
             if response.status != 200:
+                await response.read()
                 print(f"⚠️ [HTTP {response.status}] INPI para acta {nro_acta}.")
+                # Devolver None en un 500 está bien si queremos que reintente
                 return None
             html = await response.text()
             if not html or len(html) < HTML_MIN_BYTES:
-                print(
-                    f"⚠️ [Acta {nro_acta}] Body pequeño "
-                    f"({len(html) if html else 0} bytes) — rate limit. Forzando reintento."
-                )
+                print(f"⚠️ [Acta {nro_acta}] Body pequeño ({len(html) if html else 0} bytes) — rate limit. Forzando reintento.")
                 return None
             metricas.registrar_html(html, time.time() - t0, response.status)
             return html
-    except Exception:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        # PROPAGAR el error de red para que el worker sepa qué pasó
+        raise
+    except Exception as e:
+        # Errores extraños de parseo, etc.
+        print(f"❌ Error inesperado en HTML acta {nro_acta}: {e}")
         return None
 
 
