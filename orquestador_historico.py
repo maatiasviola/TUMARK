@@ -87,7 +87,7 @@ FASES = {
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.5", "DELAY_MAX": "3.5"}
     },
     "prueba_un_dia": {
-        "chunks": [("2023-08-15", "2023-08-15")], 
+        "chunks": [("2023-08-15", "2023-08-16")], 
         "n_workers": 1,
         "env": {"CONCURRENCIA": "3", "DELAY_MIN": "1.0", "DELAY_MAX": "2.0"}
     },
@@ -155,5 +155,5 @@ def main():
         for p in procs: p.wait()
 
 if __name__ == "__main__":
-    admin.reset_database()
+    #admin.reset_database()
     main()

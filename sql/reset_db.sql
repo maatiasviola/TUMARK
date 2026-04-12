@@ -10,7 +10,8 @@ DROP TABLE IF EXISTS
     actas_subitems_desnormalizados,
     actas_subitems, dim_subitems_clases_niza,
     actas, dim_estado_tramite_acta, dim_clases_niza, 
-    marcas, dim_tipo_marca, marcas_imagenes
+    marcas, dim_tipo_marca, marcas_imagenes, agentes,actas_agentes,
+    boletines, actas_boletines
 CASCADE;
 
 -- ==========================================
